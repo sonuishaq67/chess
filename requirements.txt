@@ -1,0 +1,15 @@
+# Chess Transformer - pip dependencies
+# (PyTorch is installed via conda separately for CUDA support)
+
+# PGN parsing & move conversion to UCI
+python-chess
+
+# Streaming decompression of .zst files
+zstandard
+
+# Vocabulary building (HuggingFace)
+tokenizers
+
+# Model export & inference
+onnx
+onnxruntime

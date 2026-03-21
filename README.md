@@ -56,15 +56,15 @@ A decoder-only transformer trained on Lichess game data for next-move prediction
 
 ### Phase 0: Environment & Setup
 
-- [ ] Set up Python environment (venv or conda) with core dependencies
-  - [ ] `python-chess` — PGN parsing and move conversion to UCI
-  - [ ] `zstandard` — streaming decompression of .zst files
-  - [ ] `torch` — model development and training
-  - [ ] `tokenizers` (HuggingFace) — vocabulary building
-  - [ ] `onnx` / `onnxruntime` — model export and inference
-- [ ] Get Sol supercomputer access and test job submission
-- [ ] Learn SLURM basics: `sbatch`, `srun`, `squeue`, `scancel`, resource requests
-- [ ] Set up project directory structure:
+- [x] Set up Python environment (venv or conda) with core dependencies
+  - [x] `python-chess` — PGN parsing and move conversion to UCI
+  - [x] `zstandard` — streaming decompression of .zst files
+  - [x] `torch` — model development and training
+  - [x] `tokenizers` (HuggingFace) — vocabulary building
+  - [x] `onnx` / `onnxruntime` — model export and inference
+- [x] Get Sol supercomputer access and test job submission
+- [x] Learn SLURM basics: `sbatch`, `srun`, `squeue`, `scancel`, resource requests
+- [x] Set up project directory structure:
   ```
   chess/
   ├── dataset/          # raw and processed data
@@ -78,19 +78,19 @@ A decoder-only transformer trained on Lichess game data for next-move prediction
   ├── checkpoints/      # saved model weights
   └── README.md
   ```
-- [ ] Set up version control and `.gitignore` (exclude data, checkpoints, .zst files)
+- [x] Set up version control and `.gitignore` (exclude data, checkpoints, .zst files)
 
 ### Phase 1: Data Download & Exploration
 
-- [ ] Download PGN.zst files from database.lichess.org
-  - [ ] Use `aria2c` or `xargs + curl` for parallel downloads
-  - [ ] Verify file integrity (checksums if available)
-- [ ] Explore a single sample file to understand structure
-  - [ ] Parse PGN headers: `WhiteElo`, `BlackElo`, `TimeControl`, `Termination`, `Result`
-  - [ ] Understand move representation in PGN (SAN) vs UCI
-  - [ ] Check metadata availability and consistency across months/years
-- [ ] Estimate total game count across all files
-- [ ] Estimate filtered game count (both players > 1900, base time >= 180s)
+- [x] Download PGN.zst files from database.lichess.org
+  - [x] Use `aria2c` or `xargs + curl` for parallel downloads
+  - [x] Verify file integrity (checksums if available)
+- [x] Explore a single sample file to understand structure
+  - [x] Parse PGN headers: `WhiteElo`, `BlackElo`, `TimeControl`, `Termination`, `Result`
+  - [x] Understand move representation in PGN (SAN) vs UCI
+  - [x] Check metadata availability and consistency across months/years
+- [] Estimate total game count across all files
+- [] Estimate filtered game count (both players > 1900, base time >= 180s)
 - [ ] Analyze termination reasons and their distribution
 - [ ] Decide final filter thresholds based on exploration findings
   - [ ] Minimum move count for resignations
@@ -98,20 +98,20 @@ A decoder-only transformer trained on Lichess game data for next-move prediction
 
 ### Phase 2: Data Filtering & Conversion
 
-- [ ] Build streaming pipeline: decompress .zst → parse PGN → apply filters
-  - [ ] Filter by Elo: both `WhiteElo` and `BlackElo` > 1900
-  - [ ] Filter by time control: base time >= 180 seconds
-  - [ ] Filter by termination: keep checkmate, resignation, draws (agreement/stalemate/repetition); exclude abandoned/timeout
-  - [ ] Apply minimum move threshold for resignations
-- [ ] Convert filtered PGN moves (SAN) to UCI using `python-chess`
-  - [ ] Handle edge cases: promotions (`e7e8q`), castling, en passant
-- [ ] Output format: one game per line, UCI moves space-separated
-  - [ ] Include metadata line or separate file (Elo, result, date) for later analysis
-- [ ] Run pipeline across all downloaded files
-  - [ ] Parallelize across files if needed
-- [ ] Compute dataset statistics:
-  - [ ] Total filtered games
-  - [ ] Average / median game length (in moves)
+- [x] Build streaming pipeline: decompress .zst → parse PGN → apply filters
+  - [x] Filter by Elo: both `WhiteElo` and `BlackElo` > 1900
+  - [x] Filter by time control: base time >= 180 seconds
+  - [x] Filter by termination: keep checkmate, resignation, draws (agreement/stalemate/repetition); exclude abandoned/timeout
+  - [x] Apply minimum move threshold for resignations
+- [x] Convert filtered PGN moves (SAN) to UCI using `python-chess`
+  - [x] Handle edge cases: promotions (`e7e8q`), castling, en passant
+- [x] Output format: one game per line, UCI moves space-separated
+  - [x] Include metadata line or separate file (Elo, result, date) for later analysis
+- [x] Run pipeline across all downloaded files
+  - [x] Parallelize across files if needed
+- [] Compute dataset statistics:
+  - [] Total filtered games
+  - [] Average / median game length (in moves)
   - [ ] Move frequency distribution
   - [ ] Elo distribution of filtered games
   - [ ] Result distribution (white win / black win / draw)
