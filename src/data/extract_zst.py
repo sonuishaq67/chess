@@ -132,6 +132,14 @@ def process_parquet_file(parquet_file):
                 kept += 1
 
     print(f"Done: {out_path} ({kept}/{total} games kept)")
+    
+    # Delete the parquet file to save disk space
+    try:
+        os.remove(parquet_file)
+        print(f"Deleted {parquet_file}")
+    except Exception as e:
+        print(f"Failed to delete {parquet_file}: {e}")
+        
     return total, kept
 
 
