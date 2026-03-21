@@ -1,1 +1,1 @@
-2.4TB dataset of chess games from lichess
+Dataset of chess games from HuggingFace (Lichess/standard-chess-games) in parquet format

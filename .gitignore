@@ -1,3 +1,4 @@
 *.zst
 *.pgn
+*.parquet
 *.code.*

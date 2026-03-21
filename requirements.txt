@@ -4,8 +4,12 @@
 # PGN parsing & move conversion to UCI
 python-chess
 
-# Streaming decompression of .zst files
-zstandard
+# HuggingFace dataset download
+huggingface_hub
+
+# Parquet file reading
+pyarrow
+pandas
 
 # Vocabulary building (HuggingFace)
 tokenizers

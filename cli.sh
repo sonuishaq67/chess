@@ -53,7 +53,8 @@ case "$1" in
         python -c "
 import torch
 import chess
-import zstandard
+import huggingface_hub
+import pyarrow
 import tokenizers
 import onnx
 import onnxruntime
@@ -66,22 +67,17 @@ if torch.cuda.is_available():
         ;;
 
     data)
-        info "Running full data pipeline: download -> extract -> process..."
+        info "Running full data pipeline: download -> process..."
         python src/data/extract_zst.py all
         ;;
 
     download)
-        info "Downloading .zst files from links..."
+        info "Downloading parquet files from HuggingFace..."
         python src/data/extract_zst.py download
         ;;
 
-    extract)
-        info "Extracting .zst files to .pgn (parallel)..."
-        python src/data/extract_zst.py extract ${2:+--workers $2}
-        ;;
-
     process)
-        info "Converting .pgn to UCI (parallel)..."
+        info "Converting parquet to UCI (parallel)..."
         python src/data/extract_zst.py process ${2:+--workers $2}
         ;;
 
@@ -95,14 +91,12 @@ if torch.cuda.is_available():
         echo "  check      Verify all packages import correctly"
         echo ""
         echo "Data Pipeline:"
-        echo "  data       Run full pipeline: download -> extract -> process"
-        echo "  download   Download .zst files from dataset/links"
-        echo "  extract    Decompress .zst to .pgn (parallel, optional: workers count)"
-        echo "  process    Convert .pgn to UCI format (parallel, optional: workers count)"
+        echo "  data       Run full pipeline: download -> process"
+        echo "  download   Download parquet files from HuggingFace"
+        echo "  process    Convert parquet to UCI format (parallel, optional: workers count)"
         echo ""
         echo "Examples:"
         echo "  ./cli.sh data          # run full pipeline"
-        echo "  ./cli.sh extract 64    # decompress using 64 workers"
-        echo "  ./cli.sh process 64    # convert PGN to UCI using 64 workers"
+        echo "  ./cli.sh process 64    # convert parquet to UCI using 64 workers"
         ;;
 esac

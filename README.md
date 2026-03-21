@@ -7,8 +7,8 @@ A decoder-only transformer trained on Lichess game data for next-move prediction
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        DATA PIPELINE                            │
-│  Lichess PGN.zst ──► Decompress ──► Filter ──► UCI Sequences   │
-│  (~2.4TB compressed)   (zstandard)   (Elo,TC)   (python-chess)  │
+│  HuggingFace Parquet ──► Filter ──► UCI Sequences               │
+│  (Lichess/standard-chess-games)  (Elo,TC)   (python-chess)      │
 └──────────────────────────────┬──────────────────────────────────┘
                                │
                                ▼
@@ -37,7 +37,7 @@ A decoder-only transformer trained on Lichess game data for next-move prediction
 
 | Parameter         | Value                                                                 |
 |-------------------|-----------------------------------------------------------------------|
-| Source            | [database.lichess.org](https://database.lichess.org) raw PGN.zst     |
+| Source            | [HuggingFace](https://huggingface.co/datasets/Lichess/standard-chess-games) parquet |
 | Elo filter        | Both players > 1900                                                  |
 | Time control      | Base time >= 180s (rapid/classical)                                  |
 | Move format       | UCI (e.g. `e2e4`, `g1f3`)                                           |
@@ -82,9 +82,9 @@ A decoder-only transformer trained on Lichess game data for next-move prediction
 
 ### Phase 1: Data Download & Exploration
 
-- [x] Download PGN.zst files from database.lichess.org
-  - [x] Use `aria2c` or `xargs + curl` for parallel downloads
-  - [x] Verify file integrity (checksums if available)
+- [x] Download parquet files from HuggingFace (Lichess/standard-chess-games)
+  - [x] Use `huggingface_hub` for downloads
+  - [x] Parquet format provides structured columns for efficient filtering
 - [x] Explore a single sample file to understand structure
   - [x] Parse PGN headers: `WhiteElo`, `BlackElo`, `TimeControl`, `Termination`, `Result`
   - [x] Understand move representation in PGN (SAN) vs UCI
@@ -98,17 +98,17 @@ A decoder-only transformer trained on Lichess game data for next-move prediction
 
 ### Phase 2: Data Filtering & Conversion
 
-- [x] Build streaming pipeline: decompress .zst → parse PGN → apply filters
+- [x] Build filtering pipeline from HuggingFace parquet files
   - [x] Filter by Elo: both `WhiteElo` and `BlackElo` > 1900
   - [x] Filter by time control: base time >= 180 seconds
   - [x] Filter by termination: keep checkmate, resignation, draws (agreement/stalemate/repetition); exclude abandoned/timeout
   - [x] Apply minimum move threshold for resignations
-- [x] Convert filtered PGN moves (SAN) to UCI using `python-chess`
+- [x] Convert filtered PGN movetext (SAN) to UCI using `python-chess`
   - [x] Handle edge cases: promotions (`e7e8q`), castling, en passant
 - [x] Output format: one game per line, UCI moves space-separated
   - [x] Include metadata line or separate file (Elo, result, date) for later analysis
 - [x] Run pipeline across all downloaded files
-  - [x] Parallelize across files if needed
+  - [x] Parallelize across parquet files
 - [] Compute dataset statistics:
   - [] Total filtered games
   - [] Average / median game length (in moves)
