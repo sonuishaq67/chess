@@ -3,6 +3,7 @@ import glob
 import argparse
 import io
 from multiprocessing import Pool, cpu_count
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import chess.pgn
 import pyarrow.parquet as pq
@@ -17,9 +18,35 @@ MIN_MOVES = 20
 HF_REPO = "Lichess/standard-chess-games"
 
 
-def download_dataset():
+DOWNLOAD_WORKERS = 3
+
+
+def _download_one(args):
+    """Download a single parquet file from HuggingFace. Returns (rfilename, status)."""
+    from huggingface_hub import hf_hub_download
+
+    idx, total, rfilename = args
+    local_path = os.path.join(PARQUET_DIR, rfilename.replace("/", "_"))
+    if os.path.exists(local_path):
+        print(f"[{idx}/{total}] Already exists: {local_path}")
+        return rfilename, "skipped"
+
+    print(f"[{idx}/{total}] Downloading {rfilename}...")
+    downloaded = hf_hub_download(
+        HF_REPO, filename=rfilename, repo_type="dataset",
+        revision="refs/convert/parquet", local_dir=PARQUET_DIR,
+    )
+    # Move from nested HF cache structure to flat dir
+    if downloaded != local_path:
+        os.rename(downloaded, local_path)
+
+    print(f"[{idx}/{total}] Done: {rfilename}")
+    return rfilename, "downloaded"
+
+
+def download_dataset(workers=DOWNLOAD_WORKERS):
     """Download parquet files from HuggingFace using huggingface_hub."""
-    from huggingface_hub import HfApi, hf_hub_download
+    from huggingface_hub import HfApi
 
     os.makedirs(PARQUET_DIR, exist_ok=True)
 
@@ -30,22 +57,15 @@ def download_dataset():
         path_in_repo="default", recursive=True,
     )
     parquet_files = [f.rfilename for f in files if hasattr(f, "rfilename") and f.rfilename.endswith(".parquet")]
-    print(f"Found {len(parquet_files)} parquet files to download.")
+    total = len(parquet_files)
+    print(f"Found {total} parquet files to download ({workers} parallel workers).")
 
-    for i, rfilename in enumerate(parquet_files, 1):
-        local_path = os.path.join(PARQUET_DIR, rfilename.replace("/", "_"))
-        if os.path.exists(local_path):
-            print(f"[{i}/{len(parquet_files)}] Already exists: {local_path}")
-            continue
+    tasks = [(i, total, rf) for i, rf in enumerate(parquet_files, 1)]
 
-        print(f"[{i}/{len(parquet_files)}] Downloading {rfilename}...")
-        downloaded = hf_hub_download(
-            HF_REPO, filename=rfilename, repo_type="dataset",
-            revision="refs/convert/parquet", local_dir=PARQUET_DIR,
-        )
-        # Move from nested HF cache structure to flat dir
-        if downloaded != local_path:
-            os.rename(downloaded, local_path)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_download_one, t): t for t in tasks}
+        for future in as_completed(futures):
+            future.result()  # raise any exceptions
 
     print("All parquet files downloaded.")
 
@@ -162,6 +182,6 @@ if __name__ == "__main__":
     if args.command == "all":
         run_all()
     elif args.command == "download":
-        download_dataset()
+        download_dataset(workers=args.workers or DOWNLOAD_WORKERS)
     elif args.command == "process":
         process_all_parquet_parallel(workers=args.workers)
