@@ -18,7 +18,7 @@ MIN_MOVES = 20
 def download_from_file():
     """Download .zst files from dataset/links using aria2c."""
     links_file = os.path.join(BASE_DIR, "dataset", "links")
-    ret = os.system(f"aria2c -x 16 -j 16 -d {ZST_DIR} -i {links_file}")
+    ret = os.system(f"aria2c -x 1 -j 1 -d {ZST_DIR} -i {links_file}")
     if ret != 0:
         raise RuntimeError(f"aria2c failed with exit code {ret}")
 
