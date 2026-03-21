@@ -76,36 +76,11 @@ def movetext_to_uci(movetext):
         game = chess.pgn.read_game(io.StringIO(movetext))
         if game is None:
             return None
-        board = game.board()
-        uci_moves = []
-        for move in game.mainline_moves():
-            uci_moves.append(move.uci())
-            board.push(move)
-        return " ".join(uci_moves)
+        # read_game already validates moves and generates chess.Move objects.
+        # Calling board.push() for every move is redundant overhead.
+        return " ".join(move.uci() for move in game.mainline_moves())
     except Exception:
         return None
-
-
-def passes_filters(row):
-    """Return True if the row meets Elo and time control requirements."""
-    white_elo = row.get("WhiteElo")
-    black_elo = row.get("BlackElo")
-    if white_elo is None or black_elo is None:
-        return False
-    if white_elo <= MIN_ELO or black_elo <= MIN_ELO:
-        return False
-
-    tc = row.get("TimeControl", "-")
-    if tc is None or tc == "-":
-        return False
-    try:
-        base_time = int(str(tc).split("+")[0])
-    except ValueError:
-        return False
-    if base_time < MIN_TIME_CONTROL:
-        return False
-
-    return True
 
 
 def process_parquet_file(parquet_file):
@@ -115,6 +90,7 @@ def process_parquet_file(parquet_file):
 
     print(f"Processing {parquet_file} -> {out_path}")
 
+    # Read specific columns
     table = pq.read_table(
         parquet_file,
         columns=["WhiteElo", "BlackElo", "TimeControl", "movetext"],
@@ -122,13 +98,35 @@ def process_parquet_file(parquet_file):
     df = table.to_pandas()
 
     total = len(df)
+
+    # Fast vectorized filtering (avoids iterating through non-matching rows)
+    # 1. Elo > MIN_ELO
+    df["WhiteElo"] = df["WhiteElo"].fillna(0).astype(int)
+    df["BlackElo"] = df["BlackElo"].fillna(0).astype(int)
+    mask = (df["WhiteElo"] > MIN_ELO) & (df["BlackElo"] > MIN_ELO)
+    
+    # 2. Extract base time from TimeControl
+    # Fill missing values and convert to string so string operations don't fail
+    tc_series = df["TimeControl"].fillna("-").astype(str)
+    # Extract the part before '+' using pandas string methods
+    base_time_str = tc_series.str.split("+", n=1).str[0]
+    
+    # Safely convert extracted base time strings to numeric (coercing errors to NaN and then filling with 0)
+    import pandas as pd
+    base_time = pd.to_numeric(base_time_str, errors="coerce").fillna(0)
+    
+    # 3. Combine masks
+    mask &= (base_time >= MIN_TIME_CONTROL)
+    
+    # Apply filters
+    filtered_df = df[mask]
+
     kept = 0
 
+    # Itertuples is significantly faster than iterrows
     with open(out_path, "w") as out:
-        for _, row in df.iterrows():
-            if not passes_filters(row):
-                continue
-            uci = movetext_to_uci(row["movetext"])
+        for row in filtered_df.itertuples(index=False):
+            uci = movetext_to_uci(row.movetext)
             if uci and len(uci.split()) >= MIN_MOVES:
                 out.write(uci + "\n")
                 kept += 1
