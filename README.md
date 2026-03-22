@@ -89,12 +89,12 @@ A decoder-only transformer trained on Lichess game data for next-move prediction
   - [x] Parse PGN headers: `WhiteElo`, `BlackElo`, `TimeControl`, `Termination`, `Result`
   - [x] Understand move representation in PGN (SAN) vs UCI
   - [x] Check metadata availability and consistency across months/years
-- [] Estimate total game count across all files
-- [] Estimate filtered game count (both players > 1900, base time >= 180s)
+- [x] Estimate total game count across all files
+- [x] Estimate filtered game count (both players > 1900, base time >= 180s)
 - [ ] Analyze termination reasons and their distribution
-- [ ] Decide final filter thresholds based on exploration findings
-  - [ ] Minimum move count for resignations
-  - [ ] Any additional filters worth applying
+- [x] Decide final filter thresholds based on exploration findings
+  - [x] Minimum move count for resignations
+  - [x] Any additional filters worth applying
 
 ### Phase 2: Data Filtering & Conversion
 
@@ -109,30 +109,30 @@ A decoder-only transformer trained on Lichess game data for next-move prediction
   - [x] Include metadata line or separate file (Elo, result, date) for later analysis
 - [x] Run pipeline across all downloaded files
   - [x] Parallelize across parquet files
-- [] Compute dataset statistics:
-  - [] Total filtered games
-  - [] Average / median game length (in moves)
-  - [ ] Move frequency distribution
-  - [ ] Elo distribution of filtered games
-  - [ ] Result distribution (white win / black win / draw)
+- [x] Compute dataset statistics:
+  - [x] Total filtered games
+  - [x] Average / median game length (in moves)
+  - [x] Move frequency distribution
+  - [x] Elo distribution of filtered games
+  - [x] Result distribution (white win / black win / draw)
 
 ### Phase 3: Tokenization & Tensor Preparation
 
-- [ ] Build UCI move vocabulary
-  - [ ] Enumerate all unique UCI moves seen in filtered data
-  - [ ] Add special tokens: `PAD`, `BOS`, `EOS`, `MASK`
-  - [ ] Save vocabulary mapping (token → id, id → token)
-  - [ ] Verify vocab size (~1800 + specials)
-- [ ] Tokenize all games: UCI move strings → integer sequences
-  - [ ] Prepend `BOS`, append `EOS` to each game
+- [x] Build UCI move vocabulary
+  - [x] Enumerate all unique UCI moves seen in filtered data
+  - [x] Add special tokens: `PAD`, `BOS`, `EOS`, `MASK`
+  - [x] Save vocabulary mapping (token → id, id → token)
+  - [x] Verify vocab size (~1800 + specials)
+- [x] Tokenize all games: UCI move strings → integer sequences
+  - [x] Prepend `BOS`, append `EOS` to each game
 - [ ] Create train / validation / test split
   - [ ] Split by date (preferred) or random
   - [ ] Typical split: 95% / 2.5% / 2.5% or similar
-- [ ] Pack tokenized sequences into efficient storage
-  - [ ] Memory-mapped tensors (numpy `.npy` or PyTorch `.pt`) or Arrow/Parquet
-  - [ ] Design DataLoader-friendly format (batching, padding, attention masks)
-- [ ] Transfer prepared data to Sol's fast storage (scratch filesystem)
-- [ ] Verify data loading speed with a dummy training loop
+- [x] Pack tokenized sequences into efficient storage
+  - [x] Memory-mapped tensors (numpy `.npy` or PyTorch `.pt`) or Arrow/Parquet
+  - [x] Design DataLoader-friendly format (batching, padding, attention masks)
+- [x] Transfer prepared data to Sol's fast storage (scratch filesystem)
+- [x] Verify data loading speed with a dummy training loop
 
 ### Phase 4: Transformer Architecture
 
