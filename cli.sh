@@ -67,7 +67,7 @@ if torch.cuda.is_available():
         ;;
 
     data)
-        info "Downloading and processing HuggingFace parquet files..."
+        info "Streaming download + process pipeline (parallel)..."
         python src/data/extract_zst.py all ${2:+--workers $2} ${3:+--limit $3} "${@:4}"
         ;;
 
@@ -91,15 +91,16 @@ if torch.cuda.is_available():
         echo "  check      Verify all packages import correctly"
         echo ""
         echo "Data Pipeline:"
-        echo "  data       Download + query parquet files with DuckDB, convert to UCI"
+        echo "  data       Stream download+process in parallel (3 DL + 16 proc workers)"
         echo "  download   Download parquet files only (for HPC split workflows)"
         echo "  tokenize   Tokenize UCI text files into binary .bin/.idx format"
         echo ""
         echo "Examples:"
-        echo "  ./cli.sh data              # download + process all parquet files"
+        echo "  ./cli.sh data              # stream download+process (3 DL, 16 proc)"
         echo "  ./cli.sh data 16           # use 16 processing workers"
         echo "  ./cli.sh data 8 2          # 8 workers, process only 2 files (test)"
         echo "  ./cli.sh data 1 1 --remote # remote httpfs (small batches only)"
+        echo "  ./cli.sh data 16 '' --download-workers 5  # custom DL+proc workers"
         echo "  ./cli.sh download          # download only (process later)"
         echo "  ./cli.sh tokenize          # tokenize all UCI files to binary"
         ;;
