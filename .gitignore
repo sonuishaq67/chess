@@ -1,4 +1,20 @@
+# Raw data formats
 *.zst
 *.pgn
 *.parquet
+
+# Editor/IDE
 *.code.*
+
+# Python
+__pycache__/
+*.pyc
+
+# Dataset outputs
+dataset/bin/
+dataset/uci/
+dataset/parquet/
+dataset/vocab.json
+
+# Environment
+.env

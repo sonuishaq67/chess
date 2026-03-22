@@ -67,18 +67,18 @@ if torch.cuda.is_available():
         ;;
 
     data)
-        info "Running full data pipeline: download -> process..."
-        python src/data/extract_zst.py all
+        info "Downloading and processing HuggingFace parquet files..."
+        python src/data/extract_zst.py all ${2:+--workers $2} ${3:+--limit $3} "${@:4}"
         ;;
 
     download)
         info "Downloading parquet files from HuggingFace..."
-        python src/data/extract_zst.py download
+        python src/data/extract_zst.py download ${2:+--download-workers $2} ${3:+--limit $3} "${@:4}"
         ;;
 
-    process)
-        info "Converting parquet to UCI (parallel)..."
-        python src/data/extract_zst.py process ${2:+--workers $2}
+    tokenize)
+        info "Tokenizing UCI files to binary format..."
+        python src/data/uci_tokenizer.py
         ;;
 
     *)
@@ -91,12 +91,16 @@ if torch.cuda.is_available():
         echo "  check      Verify all packages import correctly"
         echo ""
         echo "Data Pipeline:"
-        echo "  data       Run full pipeline: download -> process"
-        echo "  download   Download parquet files from HuggingFace"
-        echo "  process    Convert parquet to UCI format (parallel, optional: workers count)"
+        echo "  data       Download + query parquet files with DuckDB, convert to UCI"
+        echo "  download   Download parquet files only (for HPC split workflows)"
+        echo "  tokenize   Tokenize UCI text files into binary .bin/.idx format"
         echo ""
         echo "Examples:"
-        echo "  ./cli.sh data          # run full pipeline"
-        echo "  ./cli.sh process 64    # convert parquet to UCI using 64 workers"
+        echo "  ./cli.sh data              # download + process all parquet files"
+        echo "  ./cli.sh data 16           # use 16 processing workers"
+        echo "  ./cli.sh data 8 2          # 8 workers, process only 2 files (test)"
+        echo "  ./cli.sh data 1 1 --remote # remote httpfs (small batches only)"
+        echo "  ./cli.sh download          # download only (process later)"
+        echo "  ./cli.sh tokenize          # tokenize all UCI files to binary"
         ;;
 esac
