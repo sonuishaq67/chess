@@ -33,16 +33,31 @@ A decoder-only transformer trained on Lichess game data for next-move prediction
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+## Current Status
+
+| Phase | Status |
+|-------|--------|
+| 0. Environment & Setup | Done |
+| 1. Data Download & Exploration | Done |
+| 2. Data Filtering & Conversion | Done |
+| 3. Tokenization & Tensor Prep | ~90% — train/val/test split remaining |
+| 4. Transformer Architecture | ~80% — implemented, sanity checks remaining |
+| 5. Training on Sol | Not started (stub files) |
+| 6. Evaluation & Analysis | Not started |
+| 7. ONNX Export & Optimization | Not started (stub files) |
+| 8. Deployment as Lichess Bot | Not started (stub files) |
+
 ## Data Decisions
 
 | Parameter         | Value                                                                 |
 |-------------------|-----------------------------------------------------------------------|
 | Source            | [HuggingFace](https://huggingface.co/datasets/Lichess/standard-chess-games) parquet |
-| Elo filter        | Both players > 1900                                                  |
+| Elo filter        | Both players > 2200                                                  |
 | Time control      | Base time >= 180s (rapid/classical)                                  |
 | Move format       | UCI (e.g. `e2e4`, `g1f3`)                                           |
 | Vocab size        | ~1800 unique move tokens + special tokens                            |
-| Termination       | Checkmate, resignation, draws (agreement/stalemate/repetition). Exclude abandoned/timeout. Exact thresholds TBD after data exploration. |
+| Min moves         | 20 per game (filters short resignations/aborts)                      |
+| Termination       | Checkmate, resignation, draws (agreement/stalemate/repetition). Exclude abandoned/timeout. |
 
 ## Infrastructure
 
@@ -67,15 +82,18 @@ A decoder-only transformer trained on Lichess game data for next-move prediction
 - [x] Set up project directory structure:
   ```
   chess/
-  ├── dataset/          # raw and processed data
+  ├── dataset/
+  │   ├── parquet/       # downloaded HF parquet files
+  │   ├── uci/           # filtered games as UCI text (one game per line)
+  │   ├── bin/           # tokenized binary memmap (.bin + .idx)
+  │   └── vocab.json     # token↔id mapping (1972 tokens)
   ├── src/
-  │   ├── data/         # download, filter, tokenize scripts
-  │   ├── model/        # transformer architecture
-  │   ├── training/     # training loop, SLURM scripts
-  │   └── serving/      # ONNX export, bot integration
-  ├── configs/          # hyperparams, data filters
-  ├── notebooks/        # exploration and analysis
-  ├── checkpoints/      # saved model weights
+  │   ├── data/          # extract_zst.py, query_parquet.py, uci_tokenizer.py
+  │   ├── model/         # transformer.py, embeddings.py
+  │   ├── training/      # train.py, dataset.py, distributed.py, slurm_job.sh
+  │   └── serving/       # export.py, inference.py, bot.py
+  ├── configs/           # model.yml, training.yml
+  ├── cli.sh             # project CLI (setup, data, tokenize, etc.)
   └── README.md
   ```
 - [x] Set up version control and `.gitignore` (exclude data, checkpoints, .zst files)
@@ -91,7 +109,7 @@ A decoder-only transformer trained on Lichess game data for next-move prediction
   - [x] Check metadata availability and consistency across months/years
 - [x] Estimate total game count across all files
 - [x] Estimate filtered game count (both players > 1900, base time >= 180s)
-- [ ] Analyze termination reasons and their distribution
+- [x] Analyze termination reasons and their distribution
 - [x] Decide final filter thresholds based on exploration findings
   - [x] Minimum move count for resignations
   - [x] Any additional filters worth applying
@@ -136,20 +154,20 @@ A decoder-only transformer trained on Lichess game data for next-move prediction
 
 ### Phase 4: Transformer Architecture
 
-- [ ] Determine model hyperparameters (based on dataset size):
-  - [ ] Embedding dimension
-  - [ ] Number of attention heads
-  - [ ] Number of transformer layers
-  - [ ] Context length (max game length in moves, from Phase 2 stats)
-  - [ ] Dropout rate
-  - [ ] Vocabulary size (from Phase 3)
-- [ ] Choose positional encoding: learned vs sinusoidal vs RoPE
-- [ ] Implement decoder-only transformer
-  - [ ] Token embedding + positional encoding
-  - [ ] Causal (masked) multi-head self-attention
-  - [ ] Feed-forward network (with GELU or SiLU)
-  - [ ] Layer normalization (pre-norm preferred)
-  - [ ] Output projection to vocabulary logits
+- [x] Determine model hyperparameters (based on dataset size):
+  - [x] Embedding dimension (128 tiny / 256 small / 768 full)
+  - [x] Number of attention heads (4 tiny / 8 small / 12 full)
+  - [x] Number of transformer layers (4 tiny / 8 small / 12 full)
+  - [x] Context length: 256 moves max
+  - [x] Dropout rate: 0.1
+  - [x] Vocabulary size: 1972 (1968 UCI moves + 4 special tokens)
+- [x] Choose positional encoding: **RoPE** (Rotary Position Embeddings)
+- [x] Implement decoder-only transformer
+  - [x] Token embedding + √d_model scaling
+  - [x] Causal multi-head self-attention (PyTorch `scaled_dot_product_attention`)
+  - [x] Feed-forward network with SiLU activation
+  - [x] Pre-norm layer normalization
+  - [x] Output projection to vocabulary logits
 - [ ] Sanity checks:
   - [ ] Verify causal mask is correct (no future leakage)
   - [ ] Overfit on a tiny batch (loss → ~0)

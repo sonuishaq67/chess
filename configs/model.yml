@@ -1,0 +1,10 @@
+# Tiny config (~2M params) — for debugging and pipeline verification
+# Scale up to d_model=256/n_layers=8 (12M) or d_model=768/n_layers=12 (85M) later
+
+d_model: 128
+n_layers: 4
+n_heads: 4          # head_dim = d_model / n_heads = 32
+ffn_dim: 512        # 4 × d_model
+vocab_size: 1972  
+max_seq_len: 256
+dropout: 0.1
