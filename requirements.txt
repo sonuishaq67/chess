@@ -15,6 +15,9 @@ pandas
 # Vocabulary building (HuggingFace)
 tokenizers
 
+# Config parsing
+pyyaml
+
 # Model export & inference
 onnx
 onnxruntime

@@ -81,6 +81,11 @@ if torch.cuda.is_available():
         python src/data/uci_tokenizer.py
         ;;
 
+    train)
+        info "Starting training..."
+        python -m src.training.train ${2:+--config $2} ${3:+--model-config $3} "${@:4}"
+        ;;
+
     *)
         echo "Usage: ./cli.sh <command> [options]"
         echo ""
@@ -95,6 +100,9 @@ if torch.cuda.is_available():
         echo "  download   Download parquet files only (for HPC split workflows)"
         echo "  tokenize   Tokenize UCI text files into binary .bin/.idx format"
         echo ""
+        echo "Training:"
+        echo "  train      Train the model (single GPU)"
+        echo ""
         echo "Examples:"
         echo "  ./cli.sh data              # stream download+process (3 DL, 16 proc)"
         echo "  ./cli.sh data 16           # use 16 processing workers"
@@ -103,5 +111,8 @@ if torch.cuda.is_available():
         echo "  ./cli.sh data 16 '' --download-workers 5  # custom DL+proc workers"
         echo "  ./cli.sh download          # download only (process later)"
         echo "  ./cli.sh tokenize          # tokenize all UCI files to binary"
+        echo "  ./cli.sh train             # train with default configs"
+        echo "  ./cli.sh train configs/training.yml configs/model.yml  # custom configs"
+        echo "  ./cli.sh train '' '' --resume checkpoints/epoch_3.pt  # resume training"
         ;;
 esac

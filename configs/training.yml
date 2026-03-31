@@ -1,0 +1,22 @@
+# Training hyperparameters
+
+batch_size: 64
+learning_rate: 3.0e-4
+weight_decay: 0.1
+max_epochs: 10
+warmup_steps: 500
+
+# Logging & checkpointing
+log_every: 100          # print loss every N steps
+save_every: 2000        # save checkpoint every N steps
+checkpoint_dir: checkpoints
+
+# Data
+bin_dir: dataset/bin
+val_split: 0.05         # fraction of chunks held out for validation
+
+# Mixed precision
+use_amp: true
+
+# Gradient clipping
+grad_clip: 1.0
