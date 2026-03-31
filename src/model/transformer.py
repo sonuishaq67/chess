@@ -18,6 +18,10 @@ class TransformerConfig:
     max_seq_len: int = 256
     dropout: float = 0.1
 
+    @property
+    def head_dim(self) -> int:
+        return self.d_model // self.n_heads
+
 
 def precompute_rope_freqs(
     head_dim: int, max_seq_len: int, device: torch.device
