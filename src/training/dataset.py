@@ -11,6 +11,7 @@ PAD_ID = 0
 class ChessDataset(Dataset):
     def __init__(self, bin_dir: str, max_seq_len: int = 256, max_files: int | None = None):
         self.max_seq_len = max_seq_len
+        self.chunk_len = max_seq_len + 1  # +1 so input[:-1] and label[1:] are both max_seq_len
 
         games = []
         bin_dir = Path(bin_dir)
@@ -35,7 +36,7 @@ class ChessDataset(Dataset):
             for i in range(n_games):
                 start, end = int(offsets[i]), int(offsets[i + 1])
                 game_len = end - start
-                if game_len <= max_seq_len:
+                if game_len <= self.chunk_len:
                     games.append(tokens[start:end].copy())
 
         self.chunks = []
@@ -50,7 +51,7 @@ class ChessDataset(Dataset):
 
         for game in games:
             game_len = len(game)
-            if chunk_len + game_len <= self.max_seq_len:
+            if chunk_len + game_len <= self.chunk_len:
                 chunk.append(game)
                 chunk_len += game_len
             else:
@@ -64,8 +65,8 @@ class ChessDataset(Dataset):
 
     def _pad_chunk(self, games: list[np.ndarray], used: int) -> np.ndarray:
         arr = np.concatenate(games)
-        if used < self.max_seq_len:
-            padding = np.full(self.max_seq_len - used, PAD_ID, dtype=np.uint16)
+        if used < self.chunk_len:
+            padding = np.full(self.chunk_len - used, PAD_ID, dtype=np.uint16)
             arr = np.concatenate([arr, padding])
         return arr
 
