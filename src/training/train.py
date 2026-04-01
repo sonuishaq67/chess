@@ -140,8 +140,9 @@ def train():
         betas=(0.9, 0.95),
     )
 
+    grad_accum_steps = cfg.get("grad_accum_steps", 1)
     max_epochs = cfg.get("max_epochs", 10)
-    max_steps = max_epochs * len(train_loader)
+    max_steps = max_epochs * (len(train_loader) // grad_accum_steps)
     warmup_steps = cfg.get("warmup_steps", 500)
 
     # --- Loss ---
@@ -172,8 +173,8 @@ def train():
 
     # --- Training loop ---
     print(
-        f"\nStarting training: {max_epochs} epochs, {len(train_loader)} steps/epoch, "
-        f"{max_steps} total steps\n"
+        f"\nStarting training: {max_epochs} epochs, {len(train_loader)} micro-batches/epoch, "
+        f"{max_steps} optimizer steps (grad_accum={grad_accum_steps})\n"
     )
 
     for epoch in range(start_epoch, max_epochs):
@@ -186,56 +187,72 @@ def train():
             input_ids = input_ids.to(device)
             labels = labels.to(device)
 
-            # Update LR
-            lr = get_lr(global_step, warmup_steps, max_steps, max_lr)
-            for pg in optimizer.param_groups:
-                pg["lr"] = lr
-
             # Forward
             with torch.amp.autocast("cuda", enabled=use_amp):
                 logits = model(input_ids)  # [B, seq_len, vocab]
                 loss = criterion(
                     logits.reshape(-1, logits.size(-1)), labels.reshape(-1)
                 )
+                loss = loss / grad_accum_steps
 
-            # Backward
+            # Backward (accumulate)
             scaler.scale(loss).backward()
+
+            # Track (use unscaled loss for logging)
+            n_tokens = (labels != PAD_ID).sum().item()
+            epoch_loss += loss.item() * grad_accum_steps * n_tokens
+            epoch_tokens += n_tokens
+
+            # Optimizer step every grad_accum_steps micro-batches
+            if (batch_idx + 1) % grad_accum_steps == 0:
+                # Update LR
+                lr = get_lr(global_step, warmup_steps, max_steps, max_lr)
+                for pg in optimizer.param_groups:
+                    pg["lr"] = lr
+
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                global_step += 1
+
+                if global_step % log_every == 0:
+                    avg = epoch_loss / epoch_tokens if epoch_tokens > 0 else 0
+                    elapsed = time.time() - t0
+                    tok_per_sec = epoch_tokens / elapsed if elapsed > 0 else 0
+                    print(
+                        f"  step {global_step:>6d} | loss {loss.item() * grad_accum_steps:.4f} | "
+                        f"avg {avg:.4f} | lr {lr:.2e} | "
+                        f"{tok_per_sec:.0f} tok/s"
+                    )
+
+                if global_step % save_every == 0:
+                    path = os.path.join(ckpt_dir, f"step_{global_step}.pt")
+                    torch.save(
+                        {
+                            "model": model.state_dict(),
+                            "optimizer": optimizer.state_dict(),
+                            "scaler": scaler.state_dict(),
+                            "epoch": epoch,
+                            "step": global_step,
+                            "config": model_cfg,
+                        },
+                        path,
+                    )
+                    print(f"  checkpoint saved: {path}")
+
+        # Flush leftover accumulated gradients
+        if (batch_idx + 1) % grad_accum_steps != 0:
+            lr = get_lr(global_step, warmup_steps, max_steps, max_lr)
+            for pg in optimizer.param_groups:
+                pg["lr"] = lr
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
-
-            # Track
-            n_tokens = (labels != PAD_ID).sum().item()
-            epoch_loss += loss.item() * n_tokens
-            epoch_tokens += n_tokens
             global_step += 1
-
-            if global_step % log_every == 0:
-                avg = epoch_loss / epoch_tokens if epoch_tokens > 0 else 0
-                elapsed = time.time() - t0
-                tok_per_sec = epoch_tokens / elapsed if elapsed > 0 else 0
-                print(
-                    f"  step {global_step:>6d} | loss {loss.item():.4f} | "
-                    f"avg {avg:.4f} | lr {lr:.2e} | "
-                    f"{tok_per_sec:.0f} tok/s"
-                )
-
-            if global_step % save_every == 0:
-                path = os.path.join(ckpt_dir, f"step_{global_step}.pt")
-                torch.save(
-                    {
-                        "model": model.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "scaler": scaler.state_dict(),
-                        "epoch": epoch,
-                        "step": global_step,
-                        "config": model_cfg,
-                    },
-                    path,
-                )
-                print(f"  checkpoint saved: {path}")
 
         # Epoch summary
         train_avg = epoch_loss / epoch_tokens if epoch_tokens > 0 else 0
