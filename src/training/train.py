@@ -80,16 +80,20 @@ def train():
         train_set,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=8,
         pin_memory=True,
         drop_last=True,
+        prefetch_factor=3,
+        persistent_workers=True,
     )
     val_loader = DataLoader(
         val_set,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=4,
+        num_workers=8,
         pin_memory=True,
+        prefetch_factor=3,
+        persistent_workers=True,
     )
 
     # --- Model ---
