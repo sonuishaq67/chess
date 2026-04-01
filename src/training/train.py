@@ -76,11 +76,13 @@ def train():
     print(f"Train chunks: {train_size:,}  Val chunks: {val_size:,}")
 
     batch_size = cfg.get("batch_size", 64)
+    num_workers = min((os.cpu_count() or 8) // 2, 16)
+    print(f"DataLoader workers: {num_workers}")
     train_loader = DataLoader(
         train_set,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=8,
+        num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
         prefetch_factor=3,
@@ -90,7 +92,7 @@ def train():
         val_set,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=8,
+        num_workers=num_workers,
         pin_memory=True,
         prefetch_factor=3,
         persistent_workers=True,
