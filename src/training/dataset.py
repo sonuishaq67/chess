@@ -43,26 +43,34 @@ class ChessDataset(Dataset):
         print(f"  Scanned {len(idx_files)} files, {len(games):,} games")
 
         # Phase 2: compute packing assignments from lengths only
+        # Store as flat numpy arrays so forked workers share memory (no copy)
+        games_arr = np.array(games, dtype=np.int64)  # [N, 4] = bin_idx, start, end, game_len
         rng = np.random.default_rng(42)
-        order = rng.permutation(len(games))
+        order = rng.permutation(len(games_arr))
 
-        self.chunks = []  # list of [(bin_idx, start, end), ...]
-        cur_chunk = []
+        # Build flat game list + chunk boundary offsets
+        packed_games = []  # flat list of (bin_idx, start, end)
+        chunk_bounds = [0]  # chunk i spans packed_games[chunk_bounds[i]:chunk_bounds[i+1]]
         cur_len = 0
 
         for i in order:
-            bin_idx, start, end, game_len = games[i]
+            bin_idx, start, end, game_len = games_arr[i]
             if cur_len + game_len <= self.chunk_len:
-                cur_chunk.append((bin_idx, start, end))
+                packed_games.append((bin_idx, start, end))
                 cur_len += game_len
             else:
-                if cur_chunk:
-                    self.chunks.append(cur_chunk)
-                cur_chunk = [(bin_idx, start, end)]
-                cur_len = game_len
+                if packed_games and cur_len > 0:
+                    chunk_bounds.append(len(packed_games))
+                packed_games.append((bin_idx, start, end))
+                cur_len = int(game_len)
 
-        if cur_chunk:
-            self.chunks.append(cur_chunk)
+        if len(packed_games) > chunk_bounds[-1]:
+            chunk_bounds.append(len(packed_games))
+
+        # Store as numpy arrays — shared across forked workers, not copied
+        self._packed = np.array(packed_games, dtype=np.int64)  # [M, 3]
+        self._bounds = np.array(chunk_bounds, dtype=np.int64)  # [num_chunks + 1]
+        self._num_chunks = len(chunk_bounds) - 1
 
         # Open memmaps once (shared across all __getitem__ calls)
         self._memmaps = {}
@@ -75,18 +83,19 @@ class ChessDataset(Dataset):
         return self._memmaps[bin_idx]
 
     def __len__(self) -> int:
-        return len(self.chunks)
+        return self._num_chunks
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        chunk_games = self.chunks[idx]
+        lo, hi = self._bounds[idx], self._bounds[idx + 1]
 
         # Read token slices from memmaps and concatenate
         parts = []
         total = 0
-        for bin_idx, start, end in chunk_games:
-            mmap = self._get_memmap(bin_idx)
-            parts.append(mmap[start:end])
-            total += end - start
+        for j in range(lo, hi):
+            bin_idx, start, end = self._packed[j]
+            mmap = self._get_memmap(int(bin_idx))
+            parts.append(mmap[int(start):int(end)])
+            total += int(end) - int(start)
 
         tokens = np.concatenate(parts) if len(parts) > 1 else parts[0].copy()
 
