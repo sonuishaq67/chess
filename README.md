@@ -42,7 +42,7 @@ A decoder-only transformer trained on Lichess game data for next-move prediction
 | 2. Data Filtering & Conversion | Done |
 | 3. Tokenization & Tensor Prep | ~90% — train/val/test split remaining |
 | 4. Transformer Architecture | ~80% — implemented, sanity checks remaining |
-| 5. Training on Sol | Not started (stub files) |
+| 5. Training on Sol | ~60% — train loop + SLURM script done, distributed training remaining |
 | 6. Evaluation & Analysis | Not started |
 | 7. ONNX Export & Optimization | Not started (stub files) |
 | 8. Deployment as Lichess Bot | Not started (stub files) |
@@ -176,28 +176,28 @@ A decoder-only transformer trained on Lichess game data for next-move prediction
 
 ### Phase 5: Training on Sol
 
-- [ ] Write SLURM job scripts
-  - [ ] Resource requests: GPUs, memory, time limits
-  - [ ] Module loads and environment activation
+- [x] Write SLURM job scripts
+  - [x] Resource requests: GPUs, memory, time limits
+  - [x] Module loads and environment activation
   - [ ] Multi-node setup if needed
 - [ ] Set up distributed training
   - [ ] DDP (DistributedDataParallel) for multi-GPU
   - [ ] FSDP (FullyShardedDataParallel) if model doesn't fit in single GPU memory
-- [ ] Configure mixed precision training (bf16 or fp16)
-- [ ] Implement training loop
-  - [ ] Cross-entropy loss on next-move prediction
-  - [ ] Learning rate schedule: warmup + cosine decay
-  - [ ] Gradient clipping
-  - [ ] Optimizer: AdamW with weight decay
-- [ ] Set up logging
-  - [ ] Weights & Biases or TensorBoard
-  - [ ] Track: loss, perplexity, learning rate, gradient norms, throughput
-- [ ] Implement checkpointing strategy
-  - [ ] Save every N steps and at end of each epoch
+- [x] Configure mixed precision training (bf16 or fp16)
+- [x] Implement training loop
+  - [x] Cross-entropy loss on next-move prediction
+  - [x] Learning rate schedule: warmup + cosine decay
+  - [x] Gradient clipping
+  - [x] Optimizer: AdamW with weight decay
+- [x] Set up logging
+  - [x] Stdout logging: loss, avg loss, learning rate, throughput (tok/s)
+  - [ ] Weights & Biases or TensorBoard integration
+- [x] Implement checkpointing strategy
+  - [x] Save every N steps and at end of each epoch
   - [ ] Keep best-K checkpoints by validation loss
-  - [ ] Support resuming from checkpoint
-- [ ] Evaluate during training
-  - [ ] Validation loss and perplexity every N steps
+  - [x] Support resuming from checkpoint
+- [x] Evaluate during training
+  - [x] Validation loss every epoch
   - [ ] Top-1 and top-5 move prediction accuracy on validation set
 
 ### Phase 6: Evaluation & Analysis
