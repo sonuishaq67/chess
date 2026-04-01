@@ -11,8 +11,8 @@
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=ishaik4@asu.edu
 
-module load mamba/latest
-source activate chess
+source /home/ishaik4/miniconda3/etc/profile.d/conda.sh
+conda activate chess
 
-cd ~/Projects/chess
+cd ~/chess
 ./cli.sh train
