@@ -1,0 +1,6 @@
+# Minimal dependencies for EC2 inference/bot deployment
+# (no torch, no training deps, no data pipeline deps)
+python-chess
+numpy
+onnxruntime
+httpx

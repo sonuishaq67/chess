@@ -44,7 +44,7 @@ A decoder-only transformer trained on Lichess game data for next-move prediction
 | 4. Transformer Architecture | ~80% — implemented, sanity checks remaining |
 | 5. Training on Sol | ~60% — train loop + SLURM script done, distributed training remaining |
 | 6. Evaluation & Analysis | Not started |
-| 7. ONNX Export & Optimization | Not started (stub files) |
+| 7. ONNX Export & Optimization | ~80% — export, optimization, quantization, inference wrapper done; latency benchmark remaining |
 | 8. Deployment as Lichess Bot | Not started (stub files) |
 
 ## Data Decisions
@@ -217,13 +217,14 @@ A decoder-only transformer trained on Lichess game data for next-move prediction
 
 ### Phase 7: ONNX Export & Optimization
 
-- [ ] Export trained PyTorch model to ONNX format
-  - [ ] Define input/output signatures
-  - [ ] Handle dynamic sequence lengths
-  - [ ] Verify ONNX model outputs match PyTorch outputs (numerical parity)
-- [ ] Optimize with ONNX Runtime
-  - [ ] Graph optimizations (constant folding, operator fusion)
-  - [ ] Quantization if needed (INT8 dynamic or static)
+- [x] Export trained PyTorch model to ONNX format
+  - [x] Define input/output signatures
+  - [x] Handle dynamic sequence lengths
+  - [x] Verify ONNX model outputs match PyTorch outputs (numerical parity)
+- [x] Optimize with ONNX Runtime
+  - [x] Graph optimizations (constant folding, operator fusion)
+  - [x] Quantization if needed (INT8 dynamic or static)
+- [x] Inference wrapper with legal move filtering (python-chess)
 - [ ] Benchmark inference latency
   - [ ] Measure on target hardware (CPU and/or GPU)
   - [ ] Ensure latency is acceptable for Lichess bot (< 1–2 seconds per move)

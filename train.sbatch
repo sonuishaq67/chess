@@ -14,5 +14,7 @@
 source /home/ishaik4/miniconda3/etc/profile.d/conda.sh
 conda activate chess
 
+export PYTHONUNBUFFERED=1
+
 cd ~/chess
 ./cli.sh train
