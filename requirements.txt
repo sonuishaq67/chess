@@ -21,3 +21,6 @@ pyyaml
 # Model export & inference
 onnx
 onnxruntime
+
+# Lichess bot API client
+httpx

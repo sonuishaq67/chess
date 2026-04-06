@@ -1,0 +1,25 @@
+[Unit]
+Description=Chess Transformer Lichess Bot
+After=network-online.target
+Wants=network-online.target
+OnFailure=chess-bot-notify@%n.service
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/home/%i/chess
+Environment=LICHESS_BOT_TOKEN=
+EnvironmentFile=-/home/%i/chess/.env
+ExecStart=/home/%i/chess/venv/bin/python -m src.serving.bot \
+    --model models/model_opt.onnx \
+    --vocab dataset/vocab.json \
+    --strategy greedy \
+    --threads 4
+
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

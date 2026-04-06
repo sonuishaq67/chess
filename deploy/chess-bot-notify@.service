@@ -1,0 +1,12 @@
+[Unit]
+Description=Send email alert when %i fails
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c '\
+    echo -e "Subject: [chess-bot] %i crashed on $(hostname)\n\n\
+Unit %i failed at $(date).\n\n\
+Last 50 journal lines:\n\
+$(journalctl -u %i -n 50 --no-pager)" \
+    | sendmail ${ALERT_EMAIL}'
+EnvironmentFile=-/home/*/chess/.env
