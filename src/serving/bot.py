@@ -2,8 +2,10 @@ import argparse
 import json
 import logging
 import os
+import random
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -93,6 +95,9 @@ class LichessBot:
         accept_rated: bool = True,
         accept_casual: bool = True,
         max_concurrent_games: int = 1,
+        auto_challenge: bool = False,
+        challenge_clock_limit: int = 60,
+        challenge_clock_increment: int = 0,
     ):
         self.token = token
         self.strategy = strategy
@@ -100,6 +105,9 @@ class LichessBot:
         self.accept_rated = accept_rated
         self.accept_casual = accept_casual
         self.max_concurrent_games = max_concurrent_games
+        self.auto_challenge = auto_challenge
+        self.challenge_clock_limit = challenge_clock_limit
+        self.challenge_clock_increment = challenge_clock_increment
 
         self._headers = {"Authorization": f"Bearer {token}"}
         self._active_games: set[str] = set()
@@ -280,6 +288,93 @@ class LichessBot:
                 glog.warning("Falling back to %s in game %s", fallback, game_id)
                 self.make_move(game_id, fallback)
 
+    # -- Auto-challenge -----------------------------------------------------
+
+    def _get_online_bots(self) -> list[dict]:
+        """Fetch a page of online bots from Lichess."""
+        try:
+            resp = httpx.get(
+                f"{LICHESS_API}/bot/online",
+                headers={**self._headers, "Accept": "application/x-ndjson"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            bots = []
+            for line in resp.text.strip().split("\n"):
+                if line.strip():
+                    bots.append(json.loads(line))
+            return bots
+        except Exception as e:
+            log.warning("Failed to fetch online bots: %s", e)
+            return []
+
+    def _challenge_bot(self, username: str):
+        """Send a rated bullet challenge to another bot."""
+        try:
+            resp = self._post(
+                f"/challenge/{username}",
+                json={
+                    "rated": True,
+                    "clock.limit": self.challenge_clock_limit,
+                    "clock.increment": self.challenge_clock_increment,
+                },
+            )
+            if resp.status_code == 200:
+                log.info("Challenged %s (%d+%d)", username,
+                         self.challenge_clock_limit, self.challenge_clock_increment)
+            else:
+                log.debug("Challenge to %s failed: %s", username, resp.text)
+        except Exception as e:
+            log.warning("Error challenging %s: %s", username, e)
+
+    def _auto_challenge_loop(self):
+        """Background loop that challenges online bots when we have open slots."""
+        my_id = self.get_account().get("id", "")
+        recently_challenged: dict[str, float] = {}  # username -> timestamp
+        cooldown = 120  # seconds before re-challenging same bot
+
+        while self._running:
+            try:
+                open_slots = self.max_concurrent_games - len(self._active_games)
+                if open_slots <= 0:
+                    time.sleep(5)
+                    continue
+
+                # Clean expired cooldowns
+                now = time.time()
+                recently_challenged = {
+                    u: t for u, t in recently_challenged.items()
+                    if now - t < cooldown
+                }
+
+                bots = self._get_online_bots()
+                candidates = [
+                    b for b in bots
+                    if b.get("id", "") != my_id
+                    and b.get("id", "") not in recently_challenged
+                    and not b.get("disabled", False)
+                ]
+
+                if not candidates:
+                    time.sleep(30)
+                    continue
+
+                random.shuffle(candidates)
+                for bot in candidates[:open_slots]:
+                    bot_id = bot["id"]
+                    self._challenge_bot(bot_id)
+                    recently_challenged[bot_id] = time.time()
+                    time.sleep(1)  # small delay between challenges
+
+                time.sleep(10)
+
+            except Exception as e:
+                if self._running:
+                    log.error("Auto-challenge error: %s", e, exc_info=True)
+                    time.sleep(10)
+
+    # -- Main loop -----------------------------------------------------------
+
     def run(self):
         """Main event loop: stream events and dispatch."""
         account = self.get_account()
@@ -293,6 +388,16 @@ class LichessBot:
 
         signal.signal(signal.SIGINT, _shutdown)
         signal.signal(signal.SIGTERM, _shutdown)
+
+        # Start auto-challenge thread if enabled
+        if self.auto_challenge:
+            challenger = threading.Thread(
+                target=self._auto_challenge_loop, daemon=True, name="auto-challenger"
+            )
+            challenger.start()
+            log.info("Auto-challenge enabled (%d+%d, max %d concurrent games)",
+                     self.challenge_clock_limit, self.challenge_clock_increment,
+                     self.max_concurrent_games)
 
         while self._running:
             try:
@@ -318,8 +423,12 @@ class LichessBot:
                         elif event_type == "gameStart":
                             game_id = event["game"]["gameId"]
                             log.info("Game started: %s", game_id)
-                            # Play game synchronously (single-game bot)
-                            self.play_game(game_id)
+                            # Play game in a thread so we can handle multiple
+                            t = threading.Thread(
+                                target=self.play_game, args=(game_id,),
+                                daemon=True, name=f"game-{game_id}",
+                            )
+                            t.start()
 
                         elif event_type == "gameFinish":
                             game_id = event["game"]["gameId"]
@@ -353,6 +462,9 @@ def main():
     parser.add_argument("--top-k", type=int, default=3, help="Top-k candidates for top_k strategy")
     parser.add_argument("--threads", type=int, default=4, help="ONNX Runtime inference threads")
     parser.add_argument("--max-games", type=int, default=1, help="Max concurrent games")
+    parser.add_argument("--auto-challenge", action="store_true", help="Auto-challenge online bots")
+    parser.add_argument("--clock-limit", type=int, default=60, help="Challenge clock limit in seconds (default: 60 = bullet 1+0)")
+    parser.add_argument("--clock-increment", type=int, default=0, help="Challenge clock increment in seconds (default: 0)")
     args = parser.parse_args()
 
     token = args.token or os.environ.get("LICHESS_BOT_TOKEN")
@@ -377,6 +489,9 @@ def main():
         token=token,
         strategy=strategy,
         max_concurrent_games=args.max_games,
+        auto_challenge=args.auto_challenge,
+        challenge_clock_limit=args.clock_limit,
+        challenge_clock_increment=args.clock_increment,
     )
     bot.run()
 
