@@ -116,13 +116,20 @@ def _write_uci(rows: list, out_path: str) -> int:
     return kept
 
 
+def _unique_stem(rfilename: str) -> str:
+    """Derive a unique stem from a parquet path like 'default/train-part0/0000.parquet'."""
+    parts = Path(rfilename).parts
+    # e.g. "train-part0_0000"
+    return f"{parts[-2]}_{Path(rfilename).stem}"
+
+
 def _process_one(idx: int, total_files: int, rfilename: str) -> tuple[str, int, int, int]:
     """Query a single remote parquet file with DuckDB, filter, and write UCI output.
 
     Returns (filename, total_rows, filtered_rows, kept_after_uci).
     """
     url = f"{HF_BASE_URL}/{rfilename}"
-    stem = Path(rfilename).stem
+    stem = _unique_stem(rfilename)
     out_path = os.path.join(UCI_DIR, stem + ".txt")
 
     if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
@@ -146,7 +153,7 @@ def _process_one_local(
     idx: int, total_files: int, rfilename: str, local_path: str,
 ) -> tuple[str, int, int, int]:
     """Query a local parquet file with DuckDB, filter, and write UCI output."""
-    stem = Path(rfilename).stem
+    stem = _unique_stem(rfilename)
     out_path = os.path.join(UCI_DIR, stem + ".txt")
 
     if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
