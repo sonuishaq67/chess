@@ -163,6 +163,7 @@ def _process_one_local(
         return rfilename, 0, 0, existing
 
     con = duckdb.connect()
+    con.execute("PRAGMA threads=1")
     rows = con.execute(_build_query(local_path)).fetchall()
     filtered = len(rows)
     con.close()
