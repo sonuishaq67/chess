@@ -12,7 +12,7 @@ import queue
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import chess.pgn
@@ -380,6 +380,96 @@ def _run_processing(parquet_files, n_files, num_workers, process_fn):
           f"({grand_filtered:,} passed SQL filters). Output: {UCI_DIR}/")
 
 
+def _process_one_local_wrapper(args: tuple) -> tuple[int, int]:
+    """Top-level wrapper for ProcessPoolExecutor (picklable)."""
+    idx, total, rfilename, local_path = args
+    try:
+        _, _, filtered, kept = _process_one_local(idx, total, rfilename, local_path)
+        return filtered, kept
+    except Exception as e:
+        print(f"\n  [PROCESS ERROR] {rfilename}: {e}", flush=True)
+        return 0, 0
+
+
+def process_local_only(workers: int | None = None, cache_dir: str | None = None):
+    """Process parquet files already on disk. No downloads, no HF API calls.
+
+    Walks the local parquet directory, skips files whose UCI output already
+    exists, and parallelizes across processes (CPU-bound, GIL-bound work).
+    """
+    os.makedirs(UCI_DIR, exist_ok=True)
+    dest = cache_dir or PARQUET_DIR
+
+    if not os.path.isdir(dest):
+        print(f"ERROR: parquet directory not found: {dest}")
+        sys.exit(1)
+
+    # Walk local parquet dir; reconstruct rfilename-style relative paths
+    # so _unique_stem and log lines stay consistent with the HF layout.
+    print(f"Scanning local parquet files in {dest}...")
+    all_local: list[tuple[str, str]] = []  # (rfilename, local_path)
+    for root, _, files in os.walk(dest):
+        for f in files:
+            if not f.endswith(".parquet"):
+                continue
+            local_path = os.path.join(root, f)
+            rfilename = os.path.relpath(local_path, dest)
+            all_local.append((rfilename, local_path))
+    all_local.sort()
+
+    # Filter out files whose UCI output already exists and is non-empty
+    todo: list[tuple[str, str]] = []
+    skipped = 0
+    for rf, lp in all_local:
+        out_path = os.path.join(UCI_DIR, _unique_stem(rf) + ".txt")
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            skipped += 1
+            continue
+        todo.append((rf, lp))
+
+    n_total = len(all_local)
+    n_todo = len(todo)
+    num_workers = workers or DEFAULT_WORKERS
+    print(f"Found {n_total} local parquet files "
+          f"({skipped} already processed, {n_todo} to do)")
+    print(f"Processing with {num_workers} processes (multiprocessing, bypasses GIL)\n")
+
+    if n_todo == 0:
+        print("Nothing to do.")
+        return
+
+    grand_filtered = 0
+    grand_kept = 0
+    files_done = 0
+    bar_width = 40
+    t0 = time.time()
+
+    tasks = [(i, n_todo, rf, lp) for i, (rf, lp) in enumerate(todo, 1)]
+
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        for filtered, kept in executor.map(
+            _process_one_local_wrapper, tasks, chunksize=1,
+        ):
+            grand_filtered += filtered
+            grand_kept += kept
+            files_done += 1
+            pct = files_done / n_todo
+            filled = int(bar_width * pct)
+            bar = "█" * filled + "░" * (bar_width - filled)
+            elapsed = time.time() - t0
+            rate = files_done / elapsed if elapsed > 0 else 0
+            eta = (n_todo - files_done) / rate if rate > 0 else 0
+            sys.stdout.write(
+                f"\r  [{bar}] {files_done}/{n_todo} | "
+                f"{grand_kept:,} games kept | "
+                f"{rate:.1f} files/s | ETA {eta/60:.0f}m"
+            )
+            sys.stdout.flush()
+
+    print(f"\n\nDone. {grand_kept:,} games kept "
+          f"({grand_filtered:,} passed SQL filters). Output: {UCI_DIR}/")
+
+
 def download_only(
     limit: int | None = None,
     download_workers: int = DOWNLOAD_WORKERS, cache_dir: str | None = None,
@@ -402,7 +492,7 @@ if __name__ == "__main__":
         choices=["all", "process", "download"],
         nargs="?",
         default="all",
-        help="all/process: query + convert to UCI; download: download parquets only (default: all)",
+        help="all: download+process; process: process local parquets only; download: download only",
     )
     parser.add_argument(
         "--workers", type=int, default=None,
@@ -431,6 +521,8 @@ if __name__ == "__main__":
             limit=args.limit,
             download_workers=args.download_workers, cache_dir=args.cache_dir,
         )
+    elif args.command == "process":
+        process_local_only(workers=args.workers, cache_dir=args.cache_dir)
     else:
         process_all(
             workers=args.workers, limit=args.limit,
