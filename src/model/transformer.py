@@ -25,20 +25,26 @@ class TransformerConfig:
 
 def precompute_rope_freqs(
     head_dim: int, max_seq_len: int, device: torch.device
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     theta = 1.0 / (
         10000.0 ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim)
     )
     positions = torch.arange(max_seq_len, device=device).float()
-    angles = torch.outer(positions, theta)
-    return torch.polar(torch.ones_like(angles), angles)  # e^(j*angle)
+    angles = torch.outer(positions, theta)  # [max_seq_len, head_dim/2]
+    return torch.cos(angles), torch.sin(angles)
 
 
-def apply_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-    x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    freqs = freqs.unsqueeze(0).unsqueeze(0)
-    rotated = x_complex * freqs
-    return torch.view_as_real(rotated).flatten(-2).type_as(x)
+def apply_rope(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> torch.Tensor:
+    x_f = x.float()
+    x_even = x_f[..., ::2]
+    x_odd = x_f[..., 1::2]
+    cos = cos.unsqueeze(0).unsqueeze(0)
+    sin = sin.unsqueeze(0).unsqueeze(0)
+    out_even = x_even * cos - x_odd * sin
+    out_odd = x_even * sin + x_odd * cos
+    return torch.stack([out_even, out_odd], dim=-1).flatten(-2).type_as(x)
 
 
 class MultiHeadAttention(nn.Module):
@@ -54,7 +60,9 @@ class MultiHeadAttention(nn.Module):
 
         self.attn_dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x: torch.Tensor, rope_freqs: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, rope_cos: torch.Tensor, rope_sin: torch.Tensor
+    ) -> torch.Tensor:
         batch, seq_len, _ = x.shape
 
         q = self.w_q(x)
@@ -65,8 +73,8 @@ class MultiHeadAttention(nn.Module):
         k = k.view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
 
-        q = apply_rope(q, rope_freqs)
-        k = apply_rope(k, rope_freqs)
+        q = apply_rope(q, rope_cos, rope_sin)
+        k = apply_rope(k, rope_cos, rope_sin)
 
         out = F.scaled_dot_product_attention(
             q,
@@ -100,8 +108,10 @@ class TransformerBlock(nn.Module):
         self.ffn_norm = nn.LayerNorm(config.d_model)
         self.ffn = FeedForward(config)
 
-    def forward(self, x: torch.Tensor, rope_freqs: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x), rope_freqs)
+    def forward(
+        self, x: torch.Tensor, rope_cos: torch.Tensor, rope_sin: torch.Tensor
+    ) -> torch.Tensor:
+        x = x + self.attn(self.attn_norm(x), rope_cos, rope_sin)
         x = x + self.ffn(self.ffn_norm(x))
         return x
 
@@ -121,13 +131,11 @@ class Transformer(nn.Module):
         self.norm = nn.LayerNorm(config.d_model)
         self.output = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
-        self.register_buffer(
-            "rope_freqs",
-            precompute_rope_freqs(
-                config.head_dim, config.max_seq_len, device=torch.device("cpu")
-            ),
-            persistent=False,
+        cos, sin = precompute_rope_freqs(
+            config.head_dim, config.max_seq_len, device=torch.device("cpu")
         )
+        self.register_buffer("rope_cos", cos, persistent=False)
+        self.register_buffer("rope_sin", sin, persistent=False)
 
         self._init_weights()
 
@@ -148,9 +156,10 @@ class Transformer(nn.Module):
 
         x = self.embedding(tokens)  # [batch, seq, d_model]
         x = self.embed_dropout(x)
-        rope_freqs = self.rope_freqs[:seq_len]
+        rope_cos = self.rope_cos[:seq_len]
+        rope_sin = self.rope_sin[:seq_len]
         for block in self.blocks:
-            x = block(x, rope_freqs)
+            x = block(x, rope_cos, rope_sin)
 
         x = self.norm(x)
         logits = self.output(x)  # [batch, seq, vocab_size]

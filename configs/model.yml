@@ -1,8 +1,8 @@
-# 155M param config
-d_model: 1024
-n_layers: 16
-n_heads: 16         # head_dim = d_model / n_heads = 64
-ffn_dim: 4096       # 4 × d_model
+# ~512M param config (Chinchilla-optimal for 10B tokens)
+d_model: 1536
+n_layers: 18
+n_heads: 24         # head_dim = d_model / n_heads = 64
+ffn_dim: 6144       # 4 × d_model
 vocab_size: 1972
 max_seq_len: 256
 dropout: 0.1
