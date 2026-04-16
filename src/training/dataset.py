@@ -1,4 +1,6 @@
 import json
+import os
+import time
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -12,8 +14,10 @@ class ChessDataset(Dataset):
     def __init__(self, packing_dir: str, max_seq_len: int = 256):
         """Load pre-built packing arrays produced by `src/data/build_packing.py`.
 
-        Each rank just mmaps the two .npy files — no Python lists, no per-rank rebuild.
-        To change data subset or seed, rerun build_packing.py.
+        Bin files are preloaded into RAM at init time. This avoids per-access
+        page faults on scratch FS that were starving the HPUs. DataLoader workers
+        share the loaded arrays via fork COW — numpy's data buffer is separate
+        from the Python object header, so access from children doesn't break COW.
         """
         self.chunk_len = max_seq_len + 1
 
@@ -28,20 +32,26 @@ class ChessDataset(Dataset):
             )
 
         self.bin_paths = meta["bin_paths"]
-        # mmap_mode='r' — zero RAM load, shared across forked DataLoader workers
-        self._packed = np.load(packing_dir / "packed.npy", mmap_mode="r")
-        self._bounds = np.load(packing_dir / "bounds.npy", mmap_mode="r")
+        # Small index metadata — load fully into RAM (tiny).
+        self._packed = np.load(packing_dir / "packed.npy")
+        self._bounds = np.load(packing_dir / "bounds.npy")
         self._num_chunks = len(self._bounds) - 1
 
-        # Opened lazily per worker; numpy memmap file handles don't survive fork
-        self._memmaps: dict[int, np.ndarray] = {}
-
-    def _get_memmap(self, bin_idx: int) -> np.ndarray:
-        if bin_idx not in self._memmaps:
-            self._memmaps[bin_idx] = np.memmap(
-                self.bin_paths[bin_idx], dtype=np.uint16, mode="r"
+        # Preload every bin file into RAM. One copy per rank; workers inherit
+        # via fork COW so there is no per-worker duplication of the data buffer.
+        is_rank0 = os.environ.get("RANK", "0") == "0"
+        if is_rank0:
+            print(f"Preloading {len(self.bin_paths)} bin files into RAM...")
+        t0 = time.time()
+        self._bins: list[np.ndarray] = [
+            np.fromfile(p, dtype=np.uint16) for p in self.bin_paths
+        ]
+        if is_rank0:
+            total_gb = sum(b.nbytes for b in self._bins) / 1e9
+            print(
+                f"Loaded {total_gb:.2f} GB of token data in "
+                f"{time.time() - t0:.1f}s"
             )
-        return self._memmaps[bin_idx]
 
     def __len__(self) -> int:
         return self._num_chunks
@@ -53,8 +63,8 @@ class ChessDataset(Dataset):
         total = 0
         for j in range(lo, hi):
             bin_idx, start, end = self._packed[j]
-            mmap = self._get_memmap(int(bin_idx))
-            parts.append(mmap[int(start):int(end)])
+            arr = self._bins[int(bin_idx)]
+            parts.append(arr[int(start):int(end)])
             total += int(end) - int(start)
 
         tokens = np.concatenate(parts) if len(parts) > 1 else parts[0].copy()

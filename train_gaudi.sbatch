@@ -5,7 +5,7 @@
 #SBATCH -G 8
 #SBATCH -t 0-16:00:00
 #SBATCH -c 144
-#SBATCH --mem=128G
+#SBATCH --mem=448G
 #SBATCH -o slurm.%j.out
 #SBATCH -e slurm.%j.err
 #SBATCH --mail-type=ALL
