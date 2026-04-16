@@ -49,11 +49,6 @@ def train():
     device, local_rank, rank, world_size = setup_dist()
     is_main = rank == 0
 
-    # Habana v1.20 release notes: PyTorch >=2.5.1 SDPA can upcast to fp32 and
-    # trip synStatus graph-compile failures under bf16 autocast. Opt in to
-    # bf16 reductions inside math SDPA to keep it compilable on Gaudi.
-    torch._C._set_math_sdp_allow_fp16_bf16_reduction(True)
-
     cfg = load_yaml(args.config)
     model_cfg = load_yaml(args.model_config)
 
