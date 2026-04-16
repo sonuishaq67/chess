@@ -117,8 +117,14 @@ def train():
         if is_main:
             print(f"Resumed from {args.resume} (epoch {start_epoch}, step {global_step})")
 
-    # Flush lazy graph from .to(hpu) / state-dict load before first HCCL collective.
+    # Flush .to(hpu) / state-dict load, then BLOCK until compile+exec finish.
+    # htcore.mark_step is non-blocking; without the synchronize, a compile
+    # failure in this phase gets deferred to the next sync point and shows up
+    # with a misleading stack.
     htcore.mark_step()
+    torch.hpu.synchronize()
+    if is_main:
+        print("Model on HPU, ready for DDP wrap.", flush=True)
 
     # --- DDP wrap ---
     # broadcast_buffers=False: skip per-step buffer sync (rope cos/sin are identical on every rank).
@@ -128,9 +134,12 @@ def train():
         model, broadcast_buffers=False
     )
 
-    # Flush DDP's init-broadcast recipe before the first forward — otherwise it
-    # fuses with forward ops into one oversized lazy graph that fails to compile.
+    # Flush DDP init broadcast and BLOCK. If lazy collectives produce a
+    # fusion Synapse can't compile, error surfaces here with a clean stack.
     htcore.mark_step()
+    torch.hpu.synchronize()
+    if is_main:
+        print("DDP init broadcast complete.", flush=True)
 
     # --- Dry run ---
     if args.dry_run:
