@@ -73,7 +73,7 @@ def train():
         print(f"Train chunks: {train_size:,}  Val chunks: {val_size:,}")
 
     batch_size = cfg.get("batch_size", 128)
-    num_workers = min((os.cpu_count() or 8) // world_size, 2)
+    num_workers = min((os.cpu_count() or 8) // world_size, 8)
     if is_main:
         print(f"DataLoader workers per rank: {num_workers}")
 
@@ -87,7 +87,7 @@ def train():
         num_workers=num_workers,
         pin_memory=False,
         drop_last=True,
-        prefetch_factor=2,
+        prefetch_factor=4,
         persistent_workers=True,
     )
     val_loader = DataLoader(
@@ -96,7 +96,7 @@ def train():
         sampler=val_sampler,
         num_workers=num_workers,
         pin_memory=False,
-        prefetch_factor=2,
+        prefetch_factor=4,
         persistent_workers=True,
     )
 
@@ -203,14 +203,15 @@ def train():
     for epoch in range(start_epoch, max_epochs):
         model.train()
         train_sampler.set_epoch(epoch)  # ensures different shuffles per epoch across ranks
-        epoch_loss = 0.0
-        epoch_tokens = 0
+        # Accumulate loss/tokens on device — avoid per-step .item() syncs that flush HPU lazy graph
+        epoch_loss_t = torch.zeros((), device=device)
+        epoch_tokens_t = torch.zeros((), device=device, dtype=torch.long)
         t0 = time.time()
         batch_idx = -1
 
         for batch_idx, (input_ids, labels) in enumerate(train_loader):
-            input_ids = input_ids.to(device)
-            labels = labels.to(device)
+            input_ids = input_ids.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
             with torch.autocast(device_type="hpu", dtype=torch.bfloat16, enabled=use_amp):
                 logits = model(input_ids)
@@ -221,9 +222,9 @@ def train():
 
             loss.backward()
 
-            n_tokens = (labels != PAD_ID).sum().item()
-            epoch_loss += loss.item() * grad_accum_steps * n_tokens
-            epoch_tokens += n_tokens
+            n_tokens_t = (labels != PAD_ID).sum()
+            epoch_loss_t = epoch_loss_t + loss.detach().float() * grad_accum_steps * n_tokens_t.float()
+            epoch_tokens_t = epoch_tokens_t + n_tokens_t
 
             if (batch_idx + 1) % grad_accum_steps == 0:
                 lr = get_lr(global_step, warmup_steps, max_steps, max_lr)
@@ -237,11 +238,14 @@ def train():
                 global_step += 1
 
                 if is_main and global_step % log_every == 0:
-                    avg = epoch_loss / epoch_tokens if epoch_tokens > 0 else 0
+                    # Single sync per log window (vs per-micro-batch)
+                    loss_sum = epoch_loss_t.item()
+                    tokens_sum = epoch_tokens_t.item()
+                    avg = loss_sum / tokens_sum if tokens_sum > 0 else 0
                     elapsed = time.time() - t0
-                    tok_per_sec = epoch_tokens * world_size / elapsed if elapsed > 0 else 0
+                    tok_per_sec = tokens_sum * world_size / elapsed if elapsed > 0 else 0
                     print(
-                        f"  step {global_step:>6d} | loss {loss.item() * grad_accum_steps:.4f} | "
+                        f"  step {global_step:>6d} | "
                         f"avg {avg:.4f} | lr {lr:.2e} | {tok_per_sec:.0f} tok/s (global)"
                     )
 
@@ -270,8 +274,10 @@ def train():
             optimizer.zero_grad(set_to_none=True)
             global_step += 1
 
-        # Epoch summary
-        train_avg = epoch_loss / epoch_tokens if epoch_tokens > 0 else 0
+        # Epoch summary — single sync at epoch boundary
+        epoch_loss_val = epoch_loss_t.item()
+        epoch_tokens_val = epoch_tokens_t.item()
+        train_avg = epoch_loss_val / epoch_tokens_val if epoch_tokens_val > 0 else 0
         elapsed = time.time() - t0
         if is_main:
             print(
@@ -281,28 +287,26 @@ def train():
 
         # --- Validation ---
         model.eval()
-        val_loss = 0.0
-        val_tokens = 0
+        val_loss_t = torch.zeros((), device=device)
+        val_tokens_t = torch.zeros((), device=device, dtype=torch.long)
         with torch.no_grad():
             for input_ids, labels in val_loader:
-                input_ids = input_ids.to(device)
-                labels = labels.to(device)
+                input_ids = input_ids.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
                 with torch.autocast(device_type="hpu", dtype=torch.bfloat16, enabled=use_amp):
                     logits = model(input_ids)
                     loss = criterion(
                         logits.reshape(-1, logits.size(-1)), labels.reshape(-1)
                     )
                 htcore.mark_step()
-                n_tokens = (labels != PAD_ID).sum().item()
-                val_loss += loss.item() * n_tokens
-                val_tokens += n_tokens
+                n_tokens_t = (labels != PAD_ID).sum()
+                val_loss_t = val_loss_t + loss.detach().float() * n_tokens_t.float()
+                val_tokens_t = val_tokens_t + n_tokens_t
 
         # All-reduce val loss across all ranks for accurate global average
-        loss_t = torch.tensor(val_loss, device=device)
-        tokens_t = torch.tensor(val_tokens, device=device)
-        dist.all_reduce(loss_t, op=dist.ReduceOp.SUM)
-        dist.all_reduce(tokens_t, op=dist.ReduceOp.SUM)
-        val_avg = (loss_t / tokens_t).item()
+        dist.all_reduce(val_loss_t, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_tokens_t, op=dist.ReduceOp.SUM)
+        val_avg = (val_loss_t / val_tokens_t).item()
 
         if is_main:
             print(f"  val loss: {val_avg:.4f}\n")
