@@ -76,13 +76,19 @@ class MultiHeadAttention(nn.Module):
         q = apply_rope(q, rope_cos, rope_sin)
         k = apply_rope(k, rope_cos, rope_sin)
 
-        out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            dropout_p=self.attn_dropout.p if self.training else 0.0,
-            is_causal=True,
+        # Manual attention: F.scaled_dot_product_attention fails to compile on
+        # Gaudi lazy bf16 with is_causal=True + dropout (synStatus 26 at first
+        # forward). Explicit matmul/softmax lowers to ops Synapse handles.
+        scale = 1.0 / math.sqrt(self.head_dim)
+        scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+        causal_mask = torch.triu(
+            torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
+            diagonal=1,
         )
+        scores = scores + causal_mask
+        attn = F.softmax(scores, dim=-1)
+        attn = self.attn_dropout(attn)
+        out = torch.matmul(attn, v)
 
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, -1)
 
