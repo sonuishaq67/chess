@@ -7,7 +7,7 @@
 
 # Editor/IDE
 *.code.*
-
+*.codex
 # Python
 __pycache__/
 *.pyc
