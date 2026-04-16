@@ -4,13 +4,17 @@ import os
 import time
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, DistributedSampler, random_split
 
 import yaml
 
+import habana_frameworks.torch.core as htcore
+
 from src.model import Transformer, TransformerConfig
 from src.training.dataset import ChessDataset, PAD_ID
+from src.training.distributed import setup_dist, cleanup_dist
 
 
 def load_yaml(path: str) -> dict:
@@ -20,9 +24,7 @@ def load_yaml(path: str) -> dict:
 
 def build_model(model_cfg: dict, device: torch.device) -> Transformer:
     config = TransformerConfig(**model_cfg)
-    model = Transformer(config).to(device)
-    print(f"Model parameters: {model.count_parameters():,}")
-    return model
+    return Transformer(config).to(device)
 
 
 def get_lr(step: int, warmup_steps: int, max_steps: int, max_lr: float) -> float:
@@ -40,95 +42,125 @@ def train():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/training.yml")
     parser.add_argument("--model-config", default="configs/model.yml")
-    parser.add_argument(
-        "--resume", default=None, help="path to checkpoint to resume from"
-    )
-    parser.add_argument(
-        "--max-files", type=int, default=None, help="limit number of .bin/.idx files to load"
-    )
-    parser.add_argument(
-        "--dry-run", action="store_true", help="load data, print sample, run one batch, then exit"
-    )
+    parser.add_argument("--resume", default=None, help="path to checkpoint to resume from")
+    parser.add_argument("--dry-run", action="store_true", help="one forward pass then exit")
     args = parser.parse_args()
+
+    device, local_rank, rank, world_size = setup_dist()
+    is_main = rank == 0
 
     cfg = load_yaml(args.config)
     model_cfg = load_yaml(args.model_config)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    if is_main:
+        print(f"Device: {device}  |  world_size: {world_size}")
 
     # --- Data ---
     base_dir = os.path.dirname(os.path.abspath(__file__)).rsplit("/src", 1)[0]
-    bin_dir = os.path.join(base_dir, cfg.get("bin_dir", "dataset/bin"))
+    packing_dir = os.path.join(base_dir, cfg.get("packing_dir", "dataset/packing"))
 
-    dataset = ChessDataset(
-        bin_dir, max_seq_len=model_cfg.get("max_seq_len", 256), max_files=args.max_files
-    )
-    print(f"Total chunks: {len(dataset):,}")
+    dataset = ChessDataset(packing_dir, max_seq_len=model_cfg.get("max_seq_len", 256))
+    if is_main:
+        print(f"Total chunks: {len(dataset):,}")
 
-    # Train/val split
     val_frac = cfg.get("val_split", 0.05)
     val_size = int(len(dataset) * val_frac)
     train_size = len(dataset) - val_size
     train_set, val_set = random_split(
         dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42)
     )
-    print(f"Train chunks: {train_size:,}  Val chunks: {val_size:,}")
+    if is_main:
+        print(f"Train chunks: {train_size:,}  Val chunks: {val_size:,}")
 
-    batch_size = cfg.get("batch_size", 64)
-    num_workers = min((os.cpu_count() or 8) // 2, 16)
-    print(f"DataLoader workers: {num_workers}")
+    batch_size = cfg.get("batch_size", 128)
+    num_workers = min((os.cpu_count() or 8) // world_size, 2)
+    if is_main:
+        print(f"DataLoader workers per rank: {num_workers}")
+
+    train_sampler = DistributedSampler(train_set, num_replicas=world_size, rank=rank, shuffle=True)
+    val_sampler = DistributedSampler(val_set, num_replicas=world_size, rank=rank, shuffle=False)
+
     train_loader = DataLoader(
         train_set,
         batch_size=batch_size,
-        shuffle=True,
+        sampler=train_sampler,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=False,
         drop_last=True,
-        prefetch_factor=3,
+        prefetch_factor=2,
         persistent_workers=True,
     )
     val_loader = DataLoader(
         val_set,
         batch_size=batch_size,
-        shuffle=False,
+        sampler=val_sampler,
         num_workers=num_workers,
-        pin_memory=True,
-        prefetch_factor=3,
+        pin_memory=False,
+        prefetch_factor=2,
         persistent_workers=True,
     )
 
     # --- Model ---
     model = build_model(model_cfg, device)
+    if is_main:
+        print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    # --- Resume: load into bare model BEFORE DDP wrap ---
+    resume_ckpt = None
+    start_epoch = 0
+    global_step = 0
+    if args.resume:
+        resume_ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(resume_ckpt["model"])
+        start_epoch = resume_ckpt["epoch"]
+        global_step = resume_ckpt["step"]
+        if is_main:
+            print(f"Resumed from {args.resume} (epoch {start_epoch}, step {global_step})")
+
+    # Flush lazy graph from .to(hpu) / state-dict load before first HCCL collective.
+    htcore.mark_step()
+
+    # --- DDP wrap ---
+    # broadcast_buffers=False: skip per-step buffer sync (rope cos/sin are identical on every rank).
+    # gradient_as_bucket_view=True: gradients live in bucket storage — fewer copies, smaller recipe.
+    model = torch.nn.parallel.DistributedDataParallel(
+        model, broadcast_buffers=False, gradient_as_bucket_view=True
+    )
 
     # --- Dry run ---
     if args.dry_run:
-        import json
+        use_amp = cfg.get("use_amp", True)
+        if is_main:
+            import json
+            vocab_path = os.path.join(base_dir, "dataset", "vocab.json")
+            id2tok = {v: k for k, v in json.loads(open(vocab_path).read()).items()}
+            print("\n--- Sample chunk (first 3) ---")
+            for i in range(min(3, len(dataset))):
+                inp, tgt = dataset[i]
+                tokens = [id2tok.get(t.item(), "?") for t in inp]
+                visible = [t for t in tokens if t != "PAD"][:20]
+                print(f"  chunk {i}: {len(visible)} non-pad tokens | {' '.join(visible)} ...")
+            print("\n--- One forward pass ---")
 
-        vocab_path = os.path.join(base_dir, "dataset", "vocab.json")
-        id2tok = {v: k for k, v in json.loads(open(vocab_path).read()).items()}
-
-        print("\n--- Sample chunk (first 3) ---")
-        for i in range(min(3, len(dataset))):
-            inp, tgt = dataset[i]
-            tokens = [id2tok.get(t.item(), "?") for t in inp]
-            # Show first 20 tokens, skip PAD at the end
-            visible = [t for t in tokens if t != "PAD"][:20]
-            print(f"  chunk {i}: {len(visible)} non-pad tokens | {' '.join(visible)} ...")
-
-        print("\n--- One forward pass ---")
         inp, tgt = dataset[0]
         inp = inp.unsqueeze(0).to(device)
         tgt = tgt.unsqueeze(0).to(device)
         with torch.no_grad():
-            logits = model(inp)
-            loss = nn.CrossEntropyLoss(ignore_index=PAD_ID)(
-                logits.reshape(-1, logits.size(-1)), tgt.reshape(-1)
+            with torch.autocast(device_type="hpu", dtype=torch.bfloat16, enabled=use_amp):
+                logits = model(inp)
+                loss = nn.CrossEntropyLoss(ignore_index=PAD_ID)(
+                    logits.reshape(-1, logits.size(-1)), tgt.reshape(-1)
+                )
+        htcore.mark_step()
+        if is_main:
+            print(f"  input shape:  {inp.shape}")
+            print(f"  logits shape: {logits.shape}")
+            print(
+                f"  loss: {loss.item():.4f} "
+                f"(random init ~{math.log(model_cfg.get('vocab_size', 1972)):.2f})"
             )
-        print(f"  input shape:  {inp.shape}")
-        print(f"  logits shape: {logits.shape}")
-        print(f"  loss: {loss.item():.4f} (random init ~{math.log(model_cfg.get('vocab_size', 1972)):.2f})")
-        print("\nDry run complete.")
+            print("\nDry run complete.")
+        cleanup_dist()
         return
 
     # --- Optimizer ---
@@ -139,101 +171,86 @@ def train():
         weight_decay=cfg.get("weight_decay", 0.1),
         betas=(0.9, 0.95),
     )
+    if resume_ckpt is not None:
+        optimizer.load_state_dict(resume_ckpt["optimizer"])
 
     grad_accum_steps = cfg.get("grad_accum_steps", 1)
     max_epochs = cfg.get("max_epochs", 10)
     max_steps = max_epochs * (len(train_loader) // grad_accum_steps)
     warmup_steps = cfg.get("warmup_steps", 500)
 
-    # --- Loss ---
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_ID)
+    use_amp = cfg.get("use_amp", True)
 
-    # --- Mixed precision ---
-    use_amp = cfg.get("use_amp", True) and device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-
-    # --- Checkpointing ---
     ckpt_dir = os.path.join(base_dir, cfg.get("checkpoint_dir", "checkpoints"))
-    os.makedirs(ckpt_dir, exist_ok=True)
+    if is_main:
+        os.makedirs(ckpt_dir, exist_ok=True)
+    dist.barrier()  # all ranks wait until rank 0 creates the dir
+
     log_every = cfg.get("log_every", 100)
     save_every = cfg.get("save_every", 2000)
     grad_clip = cfg.get("grad_clip", 1.0)
 
-    # --- Resume ---
-    start_epoch = 0
-    global_step = 0
-    if args.resume:
-        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        scaler.load_state_dict(ckpt["scaler"])
-        start_epoch = ckpt["epoch"]
-        global_step = ckpt["step"]
-        print(f"Resumed from {args.resume} (epoch {start_epoch}, step {global_step})")
+    if is_main:
+        print(
+            f"\nStarting training: {max_epochs} epochs, {len(train_loader)} micro-batches/epoch, "
+            f"{max_steps} optimizer steps "
+            f"(grad_accum={grad_accum_steps}, world_size={world_size}, "
+            f"global_batch={batch_size * world_size * grad_accum_steps})\n"
+        )
 
     # --- Training loop ---
-    print(
-        f"\nStarting training: {max_epochs} epochs, {len(train_loader)} micro-batches/epoch, "
-        f"{max_steps} optimizer steps (grad_accum={grad_accum_steps})\n"
-    )
-
     for epoch in range(start_epoch, max_epochs):
         model.train()
+        train_sampler.set_epoch(epoch)  # ensures different shuffles per epoch across ranks
         epoch_loss = 0.0
         epoch_tokens = 0
         t0 = time.time()
+        batch_idx = -1
 
         for batch_idx, (input_ids, labels) in enumerate(train_loader):
             input_ids = input_ids.to(device)
             labels = labels.to(device)
 
-            # Forward
-            with torch.amp.autocast("cuda", enabled=use_amp):
-                logits = model(input_ids)  # [B, seq_len, vocab]
+            with torch.autocast(device_type="hpu", dtype=torch.bfloat16, enabled=use_amp):
+                logits = model(input_ids)
                 loss = criterion(
                     logits.reshape(-1, logits.size(-1)), labels.reshape(-1)
                 )
                 loss = loss / grad_accum_steps
 
-            # Backward (accumulate)
-            scaler.scale(loss).backward()
+            loss.backward()
 
-            # Track (use unscaled loss for logging)
             n_tokens = (labels != PAD_ID).sum().item()
             epoch_loss += loss.item() * grad_accum_steps * n_tokens
             epoch_tokens += n_tokens
 
-            # Optimizer step every grad_accum_steps micro-batches
             if (batch_idx + 1) % grad_accum_steps == 0:
-                # Update LR
                 lr = get_lr(global_step, warmup_steps, max_steps, max_lr)
                 for pg in optimizer.param_groups:
                     pg["lr"] = lr
 
-                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
+                optimizer.step()
+                htcore.mark_step()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
 
-                if global_step % log_every == 0:
+                if is_main and global_step % log_every == 0:
                     avg = epoch_loss / epoch_tokens if epoch_tokens > 0 else 0
                     elapsed = time.time() - t0
-                    tok_per_sec = epoch_tokens / elapsed if elapsed > 0 else 0
+                    tok_per_sec = epoch_tokens * world_size / elapsed if elapsed > 0 else 0
                     print(
                         f"  step {global_step:>6d} | loss {loss.item() * grad_accum_steps:.4f} | "
-                        f"avg {avg:.4f} | lr {lr:.2e} | "
-                        f"{tok_per_sec:.0f} tok/s"
+                        f"avg {avg:.4f} | lr {lr:.2e} | {tok_per_sec:.0f} tok/s (global)"
                     )
 
-                if global_step % save_every == 0:
+                if is_main and global_step % save_every == 0:
                     path = os.path.join(ckpt_dir, f"step_{global_step}.pt")
                     torch.save(
                         {
-                            "model": model.state_dict(),
+                            "model": model.module.state_dict(),
                             "optimizer": optimizer.state_dict(),
-                            "scaler": scaler.state_dict(),
                             "epoch": epoch,
                             "step": global_step,
                             "config": model_cfg,
@@ -242,27 +259,27 @@ def train():
                     )
                     print(f"  checkpoint saved: {path}")
 
-        # Flush leftover accumulated gradients
-        if (batch_idx + 1) % grad_accum_steps != 0:
+        # Flush leftover accumulated gradients at end of epoch
+        if batch_idx >= 0 and (batch_idx + 1) % grad_accum_steps != 0:
             lr = get_lr(global_step, warmup_steps, max_steps, max_lr)
             for pg in optimizer.param_groups:
                 pg["lr"] = lr
-            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
+            htcore.mark_step()
             optimizer.zero_grad(set_to_none=True)
             global_step += 1
 
         # Epoch summary
         train_avg = epoch_loss / epoch_tokens if epoch_tokens > 0 else 0
         elapsed = time.time() - t0
-        print(
-            f"\nEpoch {epoch + 1}/{max_epochs} done in {elapsed:.1f}s | "
-            f"train loss: {train_avg:.4f}"
-        )
+        if is_main:
+            print(
+                f"\nEpoch {epoch + 1}/{max_epochs} done in {elapsed:.1f}s | "
+                f"train loss: {train_avg:.4f}"
+            )
 
-        # Validation
+        # --- Validation ---
         model.eval()
         val_loss = 0.0
         val_tokens = 0
@@ -270,34 +287,44 @@ def train():
             for input_ids, labels in val_loader:
                 input_ids = input_ids.to(device)
                 labels = labels.to(device)
-                with torch.amp.autocast("cuda", enabled=use_amp):
+                with torch.autocast(device_type="hpu", dtype=torch.bfloat16, enabled=use_amp):
                     logits = model(input_ids)
                     loss = criterion(
                         logits.reshape(-1, logits.size(-1)), labels.reshape(-1)
                     )
+                htcore.mark_step()
                 n_tokens = (labels != PAD_ID).sum().item()
                 val_loss += loss.item() * n_tokens
                 val_tokens += n_tokens
 
-        val_avg = val_loss / val_tokens if val_tokens > 0 else 0
-        print(f"  val loss: {val_avg:.4f}\n")
+        # All-reduce val loss across all ranks for accurate global average
+        loss_t = torch.tensor(val_loss, device=device)
+        tokens_t = torch.tensor(val_tokens, device=device)
+        dist.all_reduce(loss_t, op=dist.ReduceOp.SUM)
+        dist.all_reduce(tokens_t, op=dist.ReduceOp.SUM)
+        val_avg = (loss_t / tokens_t).item()
 
-        # Save end-of-epoch checkpoint
-        path = os.path.join(ckpt_dir, f"epoch_{epoch + 1}.pt")
-        torch.save(
-            {
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scaler": scaler.state_dict(),
-                "epoch": epoch + 1,
-                "step": global_step,
-                "config": model_cfg,
-            },
-            path,
-        )
-        print(f"  epoch checkpoint saved: {path}")
+        if is_main:
+            print(f"  val loss: {val_avg:.4f}\n")
 
-    print("Training complete.")
+        # Save end-of-epoch checkpoint (rank 0 only)
+        if is_main:
+            path = os.path.join(ckpt_dir, f"epoch_{epoch + 1}.pt")
+            torch.save(
+                {
+                    "model": model.module.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "epoch": epoch + 1,
+                    "step": global_step,
+                    "config": model_cfg,
+                },
+                path,
+            )
+            print(f"  epoch checkpoint saved: {path}")
+
+    if is_main:
+        print("Training complete.")
+    cleanup_dist()
 
 
 if __name__ == "__main__":

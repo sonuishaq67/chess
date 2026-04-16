@@ -101,13 +101,12 @@ class OnnxTransformer(nn.Module):
         self.norm = nn.LayerNorm(config.d_model)
         self.output = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
-        # Precompute real-valued RoPE buffers from the complex freqs
-        complex_freqs = precompute_rope_freqs(
+        # Precompute real-valued RoPE buffers
+        cos, sin = precompute_rope_freqs(
             config.head_dim, config.max_seq_len, device=torch.device("cpu")
         )
-        # complex_freqs: [max_seq_len, head_dim/2] complex
-        self.register_buffer("rope_cos", complex_freqs.real.clone(), persistent=False)
-        self.register_buffer("rope_sin", complex_freqs.imag.clone(), persistent=False)
+        self.register_buffer("rope_cos", cos, persistent=False)
+        self.register_buffer("rope_sin", sin, persistent=False)
 
         # Upper-triangle causal mask filled with -inf
         mask = torch.full(

@@ -1,10 +1,12 @@
 # Training hyperparameters
+# DDP: per-GPU batch × 8 GPUs × grad_accum = global effective batch
+# 128 × 8 × 4 = 4096 tokens/step
 
-batch_size: 64
-grad_accum_steps: 8    # effective batch = 64 × 8 = 512
+batch_size: 128         # per-GPU; global = 128 × 8 GPUs = 1024
+grad_accum_steps: 4     # effective global batch = 4096
 learning_rate: 6.0e-4
 weight_decay: 0.1
-max_epochs: 1
+max_epochs: 3
 warmup_steps: 2000
 
 # Logging & checkpointing
@@ -13,10 +15,11 @@ save_every: 2000        # save checkpoint every N steps
 checkpoint_dir: checkpoints
 
 # Data
-bin_dir: dataset/bin
+# packing_dir is produced by `src/data/build_packing.py` (rebuild if max_seq_len changes)
+packing_dir: dataset/packing
 val_split: 0.05         # fraction of chunks held out for validation
 
-# Mixed precision
+# Mixed precision (BF16 on HPU — no loss scaling needed)
 use_amp: true
 
 # Gradient clipping

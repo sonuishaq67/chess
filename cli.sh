@@ -81,9 +81,19 @@ if torch.cuda.is_available():
         python src/data/uci_tokenizer.py
         ;;
 
+    build-packing)
+        info "Pre-building chunk-packing arrays for distributed training..."
+        python -m src.data.build_packing "${@:2}"
+        ;;
+
     train)
         info "Starting training..."
         python -m src.training.train ${2:+--config $2} ${3:+--model-config $3} "${@:4}"
+        ;;
+
+    train-gaudi)
+        info "Submitting 8-Gaudi DDP job to SLURM (class_gaudi QOS)..."
+        sbatch train_gaudi.sbatch
         ;;
 
     deploy-install)
@@ -177,9 +187,12 @@ if torch.cuda.is_available():
         echo "  data       Stream download+process in parallel (3 DL + 16 proc workers)"
         echo "  download   Download parquet files only (for HPC split workflows)"
         echo "  tokenize   Tokenize UCI text files into binary .bin/.idx format"
+        echo "  build-packing  Pre-build chunk-packing arrays (run once before train-gaudi)"
         echo ""
         echo "Training:"
-        echo "  train      Train the model (single GPU)"
+        echo "  train          Train the model (single GPU / local)"
+        echo "  gaudi-install  Install project deps into gaudi-pytorch env (run once on Sol)"
+        echo "  train-gaudi    Submit 8-Gaudi DDP job to SLURM (class_gaudi QOS)"
         echo ""
         echo "Deployment (EC2):"
         echo "  deploy-install             Install minimal bot deps into venv"

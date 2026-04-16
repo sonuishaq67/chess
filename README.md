@@ -231,20 +231,20 @@ A decoder-only transformer trained on Lichess game data for next-move prediction
 
 ### Phase 8: Deployment as Lichess Bot
 
-- [ ] Set up AWS EC2 instance in eu-west-3 (France)
-  - [ ] Choose instance type (CPU or GPU based on latency requirements)
-  - [ ] Install ONNX Runtime and dependencies
-- [ ] Create Lichess bot account
-  - [ ] Register account and request bot flag via Lichess API
-  - [ ] Generate API token with bot scopes
-- [ ] Implement Lichess Bot API integration
-  - [ ] Connect to game stream (SSE / WebSocket)
-  - [ ] Parse incoming game state to UCI move history
-  - [ ] Feed move history to ONNX model, get next move prediction
-  - [ ] Submit moves via Lichess API
-- [ ] Implement move selection strategy
-  - [ ] Argmax (strongest single prediction)
-  - [ ] Temperature sampling (for variety)
-  - [ ] Optionally filter to legal moves only before selection
-- [ ] Test bot in casual games
-- [ ] Monitor bot performance and resource usage in production
+- [x] Set up AWS EC2 instance in eu-west-3 (France)
+  - [x] Choose instance type (CPU or GPU based on latency requirements)
+  - [x] Install ONNX Runtime and dependencies
+- [x] Create Lichess bot account
+  - [x] Register account and request bot flag via Lichess API
+  - [x] Generate API token with bot scopes
+- [x] Implement Lichess Bot API integration
+  - [x] Connect to game stream (SSE / WebSocket)
+  - [x] Parse incoming game state to UCI move history
+  - [x] Feed move history to ONNX model, get next move prediction
+  - [x] Submit moves via Lichess API
+- [x] Implement move selection strategy
+  - [x] Argmax (strongest single prediction)
+  - [x] Temperature sampling (for variety)
+  - [x] Optionally filter to legal moves only before selection
+- [x] Test bot in casual games
+- [x] Monitor bot performance and resource usage in production
