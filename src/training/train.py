@@ -122,9 +122,10 @@ def train():
 
     # --- DDP wrap ---
     # broadcast_buffers=False: skip per-step buffer sync (rope cos/sin are identical on every rank).
-    # gradient_as_bucket_view=True: gradients live in bucket storage — fewer copies, smaller recipe.
+    # gradient_as_bucket_view left at default (False): on HPU lazy mode, bucket-view
+    # gradients (non-zero storage_offset) trip ValidateSyncInputTensors at clip_grad_norm_.
     model = torch.nn.parallel.DistributedDataParallel(
-        model, broadcast_buffers=False, gradient_as_bucket_view=True
+        model, broadcast_buffers=False
     )
 
     # --- Dry run ---
