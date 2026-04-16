@@ -222,9 +222,10 @@ def train():
 
             loss.backward()
 
-            n_tokens_t = (labels != PAD_ID).sum()
-            epoch_loss_t = epoch_loss_t + loss.detach().float() * grad_accum_steps * n_tokens_t.float()
-            epoch_tokens_t = epoch_tokens_t + n_tokens_t
+            with torch.no_grad():
+                n_tokens_t = (labels != PAD_ID).sum()
+                epoch_loss_t.add_(loss.detach().float() * grad_accum_steps * n_tokens_t.float())
+                epoch_tokens_t.add_(n_tokens_t)
 
             if (batch_idx + 1) % grad_accum_steps == 0:
                 lr = get_lr(global_step, warmup_steps, max_steps, max_lr)
@@ -300,8 +301,8 @@ def train():
                     )
                 htcore.mark_step()
                 n_tokens_t = (labels != PAD_ID).sum()
-                val_loss_t = val_loss_t + loss.detach().float() * n_tokens_t.float()
-                val_tokens_t = val_tokens_t + n_tokens_t
+                val_loss_t.add_(loss.detach().float() * n_tokens_t.float())
+                val_tokens_t.add_(n_tokens_t)
 
         # All-reduce val loss across all ranks for accurate global average
         dist.all_reduce(val_loss_t, op=dist.ReduceOp.SUM)
