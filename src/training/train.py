@@ -85,7 +85,7 @@ def train():
         batch_size=batch_size,
         sampler=train_sampler,
         num_workers=num_workers,
-        pin_memory=False,
+        pin_memory=True,
         drop_last=True,
         prefetch_factor=4,
         persistent_workers=True,
@@ -95,7 +95,7 @@ def train():
         batch_size=batch_size,
         sampler=val_sampler,
         num_workers=num_workers,
-        pin_memory=False,
+        pin_memory=True,
         prefetch_factor=4,
         persistent_workers=True,
     )
@@ -203,14 +203,17 @@ def train():
     for epoch in range(start_epoch, max_epochs):
         model.train()
         train_sampler.set_epoch(epoch)  # ensures different shuffles per epoch across ranks
-        epoch_loss = 0.0
-        epoch_tokens = 0
+        # Accumulators on device — avoids per-micro-batch .item() syncs that were
+        # flushing the HPU lazy graph and causing ~4s-busy / ~18s-idle cycles.
+        loss_sum = torch.zeros((), device=device, dtype=torch.float32)
+        token_sum = torch.zeros((), device=device, dtype=torch.float32)
+        tokens_since_log = torch.zeros((), device=device, dtype=torch.float32)
         t0 = time.time()
         batch_idx = -1
 
         for batch_idx, (input_ids, labels) in enumerate(train_loader):
-            input_ids = input_ids.to(device)
-            labels = labels.to(device)
+            input_ids = input_ids.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
             with torch.autocast(device_type="hpu", dtype=torch.bfloat16, enabled=use_amp):
                 logits = model(input_ids)
@@ -221,9 +224,11 @@ def train():
 
             loss.backward()
 
-            n_tokens = (labels != PAD_ID).sum().item()
-            epoch_loss += loss.item() * grad_accum_steps * n_tokens
-            epoch_tokens += n_tokens
+            with torch.no_grad():
+                n_tokens = (labels != PAD_ID).sum().to(torch.float32)
+                loss_sum += loss.detach() * grad_accum_steps * n_tokens
+                token_sum += n_tokens
+                tokens_since_log += n_tokens
 
             if (batch_idx + 1) % grad_accum_steps == 0:
                 lr = get_lr(global_step, warmup_steps, max_steps, max_lr)
@@ -237,13 +242,21 @@ def train():
                 global_step += 1
 
                 if is_main and global_step % log_every == 0:
-                    avg = epoch_loss / epoch_tokens if epoch_tokens > 0 else 0
+                    # One host sync per log interval, not per micro-batch.
+                    loss_val = loss_sum.item()
+                    tokens_val = token_sum.item()
+                    avg = loss_val / tokens_val if tokens_val > 0 else 0.0
                     elapsed = time.time() - t0
-                    tok_per_sec = epoch_tokens * world_size / elapsed if elapsed > 0 else 0
+                    tok_per_sec = (
+                        tokens_since_log.item() * world_size / elapsed if elapsed > 0 else 0.0
+                    )
+                    cur_loss = (loss.detach() * grad_accum_steps).item()
                     print(
-                        f"  step {global_step:>6d} | loss {loss.item() * grad_accum_steps:.4f} | "
+                        f"  step {global_step:>6d} | loss {cur_loss:.4f} | "
                         f"avg {avg:.4f} | lr {lr:.2e} | {tok_per_sec:.0f} tok/s (global)"
                     )
+                    tokens_since_log.zero_()
+                    t0 = time.time()
 
                 if is_main and global_step % save_every == 0:
                     path = os.path.join(ckpt_dir, f"step_{global_step}.pt")
@@ -270,39 +283,34 @@ def train():
             optimizer.zero_grad(set_to_none=True)
             global_step += 1
 
-        # Epoch summary
-        train_avg = epoch_loss / epoch_tokens if epoch_tokens > 0 else 0
-        elapsed = time.time() - t0
+        # Epoch summary — all-reduce device accumulators, sync once.
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_sum, op=dist.ReduceOp.SUM)
+        train_avg = (loss_sum / token_sum).item() if token_sum.item() > 0 else 0.0
         if is_main:
-            print(
-                f"\nEpoch {epoch + 1}/{max_epochs} done in {elapsed:.1f}s | "
-                f"train loss: {train_avg:.4f}"
-            )
+            print(f"\nEpoch {epoch + 1}/{max_epochs} done | train loss: {train_avg:.4f}")
 
         # --- Validation ---
         model.eval()
-        val_loss = 0.0
-        val_tokens = 0
+        val_loss_sum = torch.zeros((), device=device, dtype=torch.float32)
+        val_token_sum = torch.zeros((), device=device, dtype=torch.float32)
         with torch.no_grad():
             for input_ids, labels in val_loader:
-                input_ids = input_ids.to(device)
-                labels = labels.to(device)
+                input_ids = input_ids.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
                 with torch.autocast(device_type="hpu", dtype=torch.bfloat16, enabled=use_amp):
                     logits = model(input_ids)
                     loss = criterion(
                         logits.reshape(-1, logits.size(-1)), labels.reshape(-1)
                     )
+                n_tokens = (labels != PAD_ID).sum().to(torch.float32)
+                val_loss_sum += loss * n_tokens
+                val_token_sum += n_tokens
                 htcore.mark_step()
-                n_tokens = (labels != PAD_ID).sum().item()
-                val_loss += loss.item() * n_tokens
-                val_tokens += n_tokens
 
-        # All-reduce val loss across all ranks for accurate global average
-        loss_t = torch.tensor(val_loss, device=device)
-        tokens_t = torch.tensor(val_tokens, device=device)
-        dist.all_reduce(loss_t, op=dist.ReduceOp.SUM)
-        dist.all_reduce(tokens_t, op=dist.ReduceOp.SUM)
-        val_avg = (loss_t / tokens_t).item()
+        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_token_sum, op=dist.ReduceOp.SUM)
+        val_avg = (val_loss_sum / val_token_sum).item()
 
         if is_main:
             print(f"  val loss: {val_avg:.4f}\n")
