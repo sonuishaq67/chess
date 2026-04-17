@@ -85,7 +85,6 @@ def train():
         batch_size=batch_size,
         sampler=train_sampler,
         num_workers=num_workers,
-        pin_memory=True,
         drop_last=True,
         prefetch_factor=4,
         persistent_workers=True,
@@ -95,7 +94,6 @@ def train():
         batch_size=batch_size,
         sampler=val_sampler,
         num_workers=num_workers,
-        pin_memory=True,
         prefetch_factor=4,
         persistent_workers=True,
     )
@@ -226,8 +224,8 @@ def train():
         batch_idx = -1
 
         for batch_idx, (input_ids, labels) in enumerate(train_loader):
-            input_ids = input_ids.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
+            input_ids = input_ids.to(device)
+            labels = labels.to(device)
 
             with torch.autocast(device_type="hpu", dtype=torch.bfloat16, enabled=use_amp):
                 logits = model(input_ids)
@@ -310,8 +308,8 @@ def train():
         val_token_sum = torch.zeros((), device=device, dtype=torch.float32)
         with torch.no_grad():
             for input_ids, labels in val_loader:
-                input_ids = input_ids.to(device, non_blocking=True)
-                labels = labels.to(device, non_blocking=True)
+                input_ids = input_ids.to(device)
+                labels = labels.to(device)
                 with torch.autocast(device_type="hpu", dtype=torch.bfloat16, enabled=use_amp):
                     logits = model(input_ids)
                     loss = criterion(
