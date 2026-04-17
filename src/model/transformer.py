@@ -67,7 +67,11 @@ class MultiHeadAttention(nn.Module):
         self.attn_dropout = nn.Dropout(config.dropout)
 
     def forward(
-        self, x: torch.Tensor, rope_cos: torch.Tensor, rope_sin: torch.Tensor
+        self,
+        x: torch.Tensor,
+        rope_cos: torch.Tensor,
+        rope_sin: torch.Tensor,
+        causal_mask: torch.Tensor,
     ) -> torch.Tensor:
         batch, seq_len, _ = x.shape
 
@@ -82,15 +86,8 @@ class MultiHeadAttention(nn.Module):
         q = apply_rope(q, rope_cos, rope_sin)
         k = apply_rope(k, rope_cos, rope_sin)
 
-        # Manual attention: F.scaled_dot_product_attention fails to compile on
-        # Gaudi lazy bf16 with is_causal=True + dropout (synStatus 26 at first
-        # forward). Explicit matmul/softmax lowers to ops Synapse handles.
         scale = 1.0 / math.sqrt(self.head_dim)
         scores = torch.matmul(q, k.transpose(-2, -1)) * scale
-        causal_mask = torch.triu(
-            torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
-            diagonal=1,
-        )
         scores = scores + causal_mask
         attn = F.softmax(scores, dim=-1)
         attn = self.attn_dropout(attn)
@@ -121,9 +118,13 @@ class TransformerBlock(nn.Module):
         self.ffn = FeedForward(config)
 
     def forward(
-        self, x: torch.Tensor, rope_cos: torch.Tensor, rope_sin: torch.Tensor
+        self,
+        x: torch.Tensor,
+        rope_cos: torch.Tensor,
+        rope_sin: torch.Tensor,
+        causal_mask: torch.Tensor,
     ) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x), rope_cos, rope_sin)
+        x = x + self.attn(self.attn_norm(x), rope_cos, rope_sin, causal_mask)
         x = x + self.ffn(self.ffn_norm(x))
         return x
 
@@ -149,6 +150,16 @@ class Transformer(nn.Module):
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
 
+        # Precomputed causal mask. Creating `torch.full((S,S), -inf)` + triu inside
+        # the forward on every layer had -inf + a dynamic allocation fused into
+        # the forward graph; pre-building it once gives Synapse a plain constant.
+        # Use a large finite negative (not -inf) so bf16 addition stays sane.
+        mask = torch.full(
+            (config.max_seq_len, config.max_seq_len), -1e9, dtype=torch.float32
+        )
+        mask = torch.triu(mask, diagonal=1)
+        self.register_buffer("causal_mask", mask, persistent=False)
+
         self._init_weights()
 
     def _init_weights(self):
@@ -170,8 +181,9 @@ class Transformer(nn.Module):
         x = self.embed_dropout(x)
         rope_cos = self.rope_cos[:seq_len]
         rope_sin = self.rope_sin[:seq_len]
+        causal_mask = self.causal_mask[:seq_len, :seq_len]
         for block in self.blocks:
-            x = block(x, rope_cos, rope_sin)
+            x = block(x, rope_cos, rope_sin, causal_mask)
 
         x = self.norm(x)
         logits = self.output(x)  # [batch, seq, vocab_size]
