@@ -37,14 +37,20 @@ def precompute_rope_freqs(
 def apply_rope(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> torch.Tensor:
-    x_f = x.float()
-    x_even = x_f[..., ::2]
-    x_odd = x_f[..., 1::2]
-    cos = cos.unsqueeze(0).unsqueeze(0)
-    sin = sin.unsqueeze(0).unsqueeze(0)
-    out_even = x_even * cos - x_odd * sin
-    out_odd = x_even * sin + x_odd * cos
-    return torch.stack([out_even, out_odd], dim=-1).flatten(-2).type_as(x)
+    # Stay in x's dtype (bf16 under autocast) and avoid non-unit-stride slices
+    # `[..., ::2]` + `stack/flatten`. Synapse compile (synStatus 26) fails on
+    # the fp32 round-trip + strided-view pattern on lazy HPU.
+    cos = cos.to(dtype=x.dtype)[None, None, :, :]
+    sin = sin.to(dtype=x.dtype)[None, None, :, :]
+
+    x2 = x.reshape(*x.shape[:-1], -1, 2)
+    x0 = x2[..., 0]
+    x1 = x2[..., 1]
+
+    out = torch.empty_like(x2)
+    out[..., 0] = x0 * cos - x1 * sin
+    out[..., 1] = x0 * sin + x1 * cos
+    return out.reshape_as(x)
 
 
 class MultiHeadAttention(nn.Module):
