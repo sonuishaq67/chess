@@ -344,6 +344,12 @@ def train():
                     )
                     loss = loss / grad_accum_steps
                 loss.backward()
+            # Flush the micro-batch graph. Without this, no_sync() removes DDP's
+            # per-step all-reduce (which used to implicitly dispatch), so all 8
+            # accum micro-batches queue up in lazy mode — peak activation memory
+            # becomes 8× larger and OOMs (slurm.51590531: 192 MB attention-scores
+            # tensor, 18 layers × 8 micro-batches = 27 GB).
+            htcore.mark_step()
 
             with torch.no_grad():
                 n_tokens = (labels != PAD_ID).sum().to(torch.float32)
