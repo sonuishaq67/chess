@@ -67,7 +67,10 @@ def _fused_attn_forward(
     k = apply_rope(k, rope_cos, rope_sin)
 
     dropout_p = self.attn_dropout.p if self.training else 0.0
-    out = FusedSDPA.apply(q, k, v, None, dropout_p, True, None, "None", False)
+    # recompute_mode=True: recompute softmax in backward instead of caching.
+    # Trades ~5% compute for meaningful memory savings; fixed an OOM at 48 MB
+    # when we were sitting at 96/98 GB pool.
+    out = FusedSDPA.apply(q, k, v, None, dropout_p, True, None, "None", True)
 
     out = out.transpose(1, 2).contiguous().view(batch, seq_len, -1)
     return self.w_o(out)
@@ -115,6 +118,11 @@ def train():
         action="store_true",
         help="disable wrap_in_hpu_graph (fallback if graph capture misbehaves)",
     )
+    parser.add_argument(
+        "--no-fused-sdpa",
+        action="store_true",
+        help="fallback: keep the manual attention forward from transformer.py",
+    )
     args = parser.parse_args()
 
     device, local_rank, rank, world_size = setup_dist()
@@ -129,9 +137,12 @@ def train():
     # Patch MultiHeadAttention.forward -> FusedSDPA for the training process
     # only. Leaves src/model/transformer.py untouched so ONNX export for the
     # Lichess bot keeps its portable manual-attention forward.
-    MultiHeadAttention.forward = _fused_attn_forward
-    if is_main:
-        print("Patched MultiHeadAttention.forward -> FusedSDPA (is_causal=True)")
+    if not args.no_fused_sdpa:
+        MultiHeadAttention.forward = _fused_attn_forward
+        if is_main:
+            print("Patched MultiHeadAttention.forward -> FusedSDPA (is_causal=True)")
+    elif is_main:
+        print("Keeping manual attention (--no-fused-sdpa)")
 
     # --- Data ---
     base_dir = os.path.dirname(os.path.abspath(__file__)).rsplit("/src", 1)[0]
@@ -199,19 +210,8 @@ def train():
     if is_main:
         print("Model on HPU, ready for DDP wrap.", flush=True)
 
-    # --- HPU Graph wrap (inner) ---
-    # Wrap BEFORE DDP so DDP is the outer wrapper (required for model.no_sync()).
-    # Static shapes guaranteed by ChessDataset padding to chunk_len=257 and
-    # drop_last=True on both loaders. disable_tensor_cache=True regenerates
-    # dropout RNG state per replay so stochastic regularization still works.
-    if not args.no_hpu_graphs:
-        model = htgraphs.wrap_in_hpu_graph(model, disable_tensor_cache=True)
-        htcore.mark_step()
-        torch.hpu.synchronize()
-        if is_main:
-            print("HPU graph capture ready.", flush=True)
-
     # --- DDP wrap (outer) ---
+    # DDP MUST be outermost wrapper for model.no_sync() to be callable.
     model = torch.nn.parallel.DistributedDataParallel(
         model, broadcast_buffers=False
     )
@@ -220,6 +220,22 @@ def train():
     torch.hpu.synchronize()
     if is_main:
         print("DDP init broadcast complete.", flush=True)
+
+    # --- HPU Graph wrap (inner module) ---
+    # Wrap AFTER DDP init and target model.module, not model. Wrapping DDP
+    # itself, or wrapping before DDP, deadlocks DDP's init-time parameter
+    # broadcast (Synapse "No progress error" observed in slurm.51577432).
+    # Static shapes guaranteed by ChessDataset padding to chunk_len=257 and
+    # drop_last=True on both loaders. disable_tensor_cache=True regenerates
+    # dropout RNG state per replay so stochastic regularization still works.
+    if not args.no_hpu_graphs:
+        model.module = htgraphs.wrap_in_hpu_graph(
+            model.module, disable_tensor_cache=True
+        )
+        htcore.mark_step()
+        torch.hpu.synchronize()
+        if is_main:
+            print("HPU graph capture ready (wrapped DDP.module).", flush=True)
 
     # --- Dry run ---
     if args.dry_run:

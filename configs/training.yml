@@ -1,9 +1,9 @@
 # Training hyperparameters
 # DDP: per-GPU batch × 8 GPUs × grad_accum = global effective batch
-# 128 × 8 × 4 = 4096 tokens/step
+# 64 × 8 × 8 = 4096 tokens/step
 
-batch_size: 128         # per-GPU; global = 128 × 8 GPUs = 1024
-grad_accum_steps: 4     # effective global batch = 4096
+batch_size: 64          # per-GPU; global = 64 × 8 GPUs = 512
+grad_accum_steps: 8     # effective global batch = 4096
 learning_rate: 6.0e-4
 weight_decay: 0.1
 max_epochs: 3
