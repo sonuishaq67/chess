@@ -1,0 +1,28 @@
+Bootstrap: docker
+From: vault.habana.ai/gaudi-docker/1.23.0/ubuntu22.04/habanalabs/pytorch-installer-2.6.0:latest
+
+# Matches Sol host driver 1.23.0-2eae87a (confirmed via `hl-smi` on gaudi002).
+# Build: apptainer build /scratch/$USER/sif/chess-gaudi.sif chess-gaudi.def
+
+%post
+    pip install --no-cache-dir \
+        python-chess \
+        huggingface_hub \
+        duckdb \
+        pyarrow \
+        pandas \
+        polars \
+        tokenizers \
+        pyyaml \
+        onnx \
+        onnxruntime \
+        httpx
+
+%environment
+    export PT_HPU_LAZY_MODE=1
+    export PT_HPU_ENABLE_LAZY_COLLECTIVES=0
+    export PYTHONUNBUFFERED=1
+
+%labels
+    Purpose chess-training-gaudi
+    Base vault.habana.ai/gaudi-docker/1.23.0/ubuntu22.04/habanalabs/pytorch-installer-2.6.0

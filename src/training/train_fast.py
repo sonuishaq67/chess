@@ -67,10 +67,7 @@ def _fused_attn_forward(
     k = apply_rope(k, rope_cos, rope_sin)
 
     dropout_p = self.attn_dropout.p if self.training else 0.0
-    # recompute_mode=True: recompute softmax in backward instead of caching.
-    # Trades ~5% compute for meaningful memory savings; fixed an OOM at 48 MB
-    # when we were sitting at 96/98 GB pool.
-    out = FusedSDPA.apply(q, k, v, None, dropout_p, True, None, "None", True)
+    out = FusedSDPA.apply(q, k, v, None, dropout_p, True, None, "None", False)
 
     out = out.transpose(1, 2).contiguous().view(batch, seq_len, -1)
     return self.w_o(out)
@@ -122,6 +119,11 @@ def train():
         "--no-fused-sdpa",
         action="store_true",
         help="fallback: keep the manual attention forward from transformer.py",
+    )
+    parser.add_argument(
+        "--profile-phases",
+        action="store_true",
+        help="time dl/fwd/bwd/opt/mark on first 20 micro-batches then exit",
     )
     args = parser.parse_args()
 
@@ -221,21 +223,23 @@ def train():
     if is_main:
         print("DDP init broadcast complete.", flush=True)
 
-    # --- HPU Graph wrap (inner module) ---
-    # Wrap AFTER DDP init and target model.module, not model. Wrapping DDP
-    # itself, or wrapping before DDP, deadlocks DDP's init-time parameter
-    # broadcast (Synapse "No progress error" observed in slurm.51577432).
-    # Static shapes guaranteed by ChessDataset padding to chunk_len=257 and
-    # drop_last=True on both loaders. disable_tensor_cache=True regenerates
-    # dropout RNG state per replay so stochastic regularization still works.
+    # Graph compilation path:
+    #   - Diffusion env (habana-torch-plugin 1.22.0.740): torch.compile works.
+    #   - pytorch-2.9.0-gaudi (1.23.0.695): broken install — undefined C++ symbol
+    #     _ZN6habana5graph12GraphStorage3getEv in _recipe_compiler_C.so. Pass
+    #     --no-hpu-graphs on that env to fall back to pure lazy mode at ~54k tok/s.
+    #   - wrap_in_hpu_graph: documented inference-only; crashes on DDP + no_sync.
     if not args.no_hpu_graphs:
-        model.module = htgraphs.wrap_in_hpu_graph(
-            model.module, disable_tensor_cache=True
-        )
+        model = torch.compile(model, backend="hpu_backend")
         htcore.mark_step()
         torch.hpu.synchronize()
         if is_main:
-            print("HPU graph capture ready (wrapped DDP.module).", flush=True)
+            print("torch.compile ready (hpu_backend).", flush=True)
+    else:
+        htcore.mark_step()
+        torch.hpu.synchronize()
+        if is_main:
+            print("Lazy mode ready (--no-hpu-graphs).", flush=True)
 
     # --- Dry run ---
     if args.dry_run:
@@ -314,6 +318,77 @@ def train():
             f"global_batch={batch_size * world_size * grad_accum_steps})\n"
         )
 
+    if args.profile_phases:
+        if is_main:
+            print("--profile-phases: timing dl/fwd/bwd/opt/mark over 25 micro-batches\n", flush=True)
+        model.train()
+        train_sampler.set_epoch(0)
+        # warm-up: 5 micro-batches so graph cache is hot before timing
+        warmup_n = 5
+        profile_n = 20
+        t_dl = t_fwd = t_bwd = t_opt = t_mark = 0.0
+        it = iter(train_loader)
+        for i in range(warmup_n + profile_n):
+            measure = i >= warmup_n
+            is_last_accum = ((i + 1) % grad_accum_steps) == 0
+            sync_ctx = contextlib.nullcontext() if is_last_accum else model.no_sync()
+
+            if measure:
+                torch.hpu.synchronize()
+            t0 = time.time()
+            input_ids, labels = next(it)
+            input_ids = input_ids.to(device)
+            labels = labels.to(device)
+            if measure:
+                torch.hpu.synchronize()
+                t_dl += time.time() - t0
+
+            with sync_ctx:
+                if measure:
+                    t0 = time.time()
+                with torch.autocast(device_type="hpu", dtype=torch.bfloat16, enabled=use_amp):
+                    logits = model(input_ids)
+                    loss = criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
+                    loss = loss / grad_accum_steps
+                if measure:
+                    torch.hpu.synchronize()
+                    t_fwd += time.time() - t0
+                    t0 = time.time()
+                loss.backward()
+                if measure:
+                    torch.hpu.synchronize()
+                    t_bwd += time.time() - t0
+
+            if measure:
+                t0 = time.time()
+            htcore.mark_step()
+            if measure:
+                torch.hpu.synchronize()
+                t_mark += time.time() - t0
+
+            if is_last_accum:
+                if measure:
+                    t0 = time.time()
+                _device_clip_grad_norm(model.parameters(), grad_clip)
+                optimizer.step()
+                htcore.mark_step()
+                optimizer.zero_grad(set_to_none=True)
+                if measure:
+                    torch.hpu.synchronize()
+                    t_opt += time.time() - t0
+
+        if is_main:
+            total = t_dl + t_fwd + t_bwd + t_opt + t_mark
+            print(
+                f"profile over {profile_n} micro-batches (after {warmup_n} warm-up):\n"
+                f"  dl={t_dl:.2f}s  fwd={t_fwd:.2f}s  bwd={t_bwd:.2f}s  "
+                f"opt={t_opt:.2f}s  mark={t_mark:.2f}s  total={total:.2f}s\n"
+                f"  avg per micro-batch: {total/profile_n*1000:.0f} ms",
+                flush=True,
+            )
+        cleanup_dist()
+        return
+
     stop = False
     for epoch in range(start_epoch, max_epochs):
         if stop:
@@ -325,6 +400,7 @@ def train():
         tokens_since_log = torch.zeros((), device=device, dtype=torch.float32)
         t0 = time.time()
         batch_idx = -1
+        first_step_t0 = time.time() if epoch == start_epoch else None
 
         for batch_idx, (input_ids, labels) in enumerate(train_loader):
             input_ids = input_ids.to(device)
@@ -350,6 +426,14 @@ def train():
             # becomes 8× larger and OOMs (slurm.51590531: 192 MB attention-scores
             # tensor, 18 layers × 8 micro-batches = 27 GB).
             htcore.mark_step()
+
+            if first_step_t0 is not None and batch_idx == 0:
+                torch.hpu.synchronize()
+                first_step_dt = time.time() - first_step_t0
+                if is_main:
+                    print(f"  first-step compile/warmup: {first_step_dt:.1f}s", flush=True)
+                first_step_t0 = None
+                t0 = time.time()
 
             with torch.no_grad():
                 n_tokens = (labels != PAD_ID).sum().to(torch.float32)
