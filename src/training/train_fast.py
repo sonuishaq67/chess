@@ -222,20 +222,17 @@ def train():
         print("DDP init broadcast complete.", flush=True)
 
     # --- HPU Graph wrap (inner module) ---
-    # Wrap AFTER DDP init and target model.module, not model. Wrapping DDP
-    # itself, or wrapping before DDP, deadlocks DDP's init-time parameter
-    # broadcast (Synapse "No progress error" observed in slurm.51577432).
-    # Static shapes guaranteed by ChessDataset padding to chunk_len=257 and
-    # drop_last=True on both loaders. disable_tensor_cache=True regenerates
-    # dropout RNG state per replay so stochastic regularization still works.
+    # torch.compile is Habana's supported graph-compilation path for training.
+    # wrap_in_hpu_graph is documented only for inference and deadlocks/crashes
+    # on backward + DDP no_sync (slurm.51595539: "Empty tensor optional" at first
+    # mark_step after first backward). Dynamo inserts graph breaks around DDP's
+    # hooks, tolerating the sync/no-sync toggle across accum micro-batches.
     if not args.no_hpu_graphs:
-        model.module = htgraphs.wrap_in_hpu_graph(
-            model.module, disable_tensor_cache=True
-        )
+        model = torch.compile(model, backend="hpu_backend")
         htcore.mark_step()
         torch.hpu.synchronize()
         if is_main:
-            print("HPU graph capture ready (wrapped DDP.module).", flush=True)
+            print("torch.compile ready (hpu_backend).", flush=True)
 
     # --- Dry run ---
     if args.dry_run:
@@ -325,6 +322,7 @@ def train():
         tokens_since_log = torch.zeros((), device=device, dtype=torch.float32)
         t0 = time.time()
         batch_idx = -1
+        first_step_t0 = time.time() if epoch == start_epoch else None
 
         for batch_idx, (input_ids, labels) in enumerate(train_loader):
             input_ids = input_ids.to(device)
@@ -350,6 +348,14 @@ def train():
             # becomes 8× larger and OOMs (slurm.51590531: 192 MB attention-scores
             # tensor, 18 layers × 8 micro-batches = 27 GB).
             htcore.mark_step()
+
+            if first_step_t0 is not None and batch_idx == 0:
+                torch.hpu.synchronize()
+                first_step_dt = time.time() - first_step_t0
+                if is_main:
+                    print(f"  first-step compile/warmup: {first_step_dt:.1f}s", flush=True)
+                first_step_t0 = None
+                t0 = time.time()
 
             with torch.no_grad():
                 n_tokens = (labels != PAD_ID).sum().to(torch.float32)
