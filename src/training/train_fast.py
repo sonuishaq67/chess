@@ -67,10 +67,7 @@ def _fused_attn_forward(
     k = apply_rope(k, rope_cos, rope_sin)
 
     dropout_p = self.attn_dropout.p if self.training else 0.0
-    # recompute_mode=True: recompute softmax in backward instead of caching.
-    # Trades ~5% compute for meaningful memory savings; fixed an OOM at 48 MB
-    # when we were sitting at 96/98 GB pool.
-    out = FusedSDPA.apply(q, k, v, None, dropout_p, True, None, "None", True)
+    out = FusedSDPA.apply(q, k, v, None, dropout_p, True, None, "None", False)
 
     out = out.transpose(1, 2).contiguous().view(batch, seq_len, -1)
     return self.w_o(out)
@@ -122,6 +119,11 @@ def train():
         "--no-fused-sdpa",
         action="store_true",
         help="fallback: keep the manual attention forward from transformer.py",
+    )
+    parser.add_argument(
+        "--profile-phases",
+        action="store_true",
+        help="time dl/fwd/bwd/opt/mark on first 20 micro-batches then exit",
     )
     args = parser.parse_args()
 
@@ -221,18 +223,24 @@ def train():
     if is_main:
         print("DDP init broadcast complete.", flush=True)
 
-    # --- HPU Graph wrap (inner module) ---
-    # torch.compile is Habana's supported graph-compilation path for training.
-    # wrap_in_hpu_graph is documented only for inference and deadlocks/crashes
-    # on backward + DDP no_sync (slurm.51595539: "Empty tensor optional" at first
-    # mark_step after first backward). Dynamo inserts graph breaks around DDP's
-    # hooks, tolerating the sync/no-sync toggle across accum micro-batches.
+    # Graph compilation paths on Sol's pytorch-2.9.0-gaudi module are all blocked:
+    #   - wrap_in_hpu_graph: documented inference-only; crashes with "Empty tensor
+    #     optional" on backward + DDP no_sync (slurm.51595539).
+    #   - torch.compile(backend="hpu_backend"): broken install — undefined C++
+    #     symbol _ZN6habana5graph12GraphStorage3getEv in _recipe_compiler_C.so
+    #     (slurm.51596447, slurm.51596747).
+    # Fail loudly up-front if the user forgets --no-hpu-graphs, so we don't eat
+    # 28 min of data preload before hitting the ImportError.
     if not args.no_hpu_graphs:
-        model = torch.compile(model, backend="hpu_backend")
-        htcore.mark_step()
-        torch.hpu.synchronize()
-        if is_main:
-            print("torch.compile ready (hpu_backend).", flush=True)
+        raise RuntimeError(
+            "Graph compilation disabled: both wrap_in_hpu_graph and "
+            "torch.compile(backend='hpu_backend') are blocked on this Sol module. "
+            "Pass --no-hpu-graphs to run in pure lazy mode."
+        )
+    htcore.mark_step()
+    torch.hpu.synchronize()
+    if is_main:
+        print("Lazy mode ready (--no-hpu-graphs).", flush=True)
 
     # --- Dry run ---
     if args.dry_run:
@@ -310,6 +318,77 @@ def train():
             f"(grad_accum={grad_accum_steps}, world_size={world_size}, "
             f"global_batch={batch_size * world_size * grad_accum_steps})\n"
         )
+
+    if args.profile_phases:
+        if is_main:
+            print("--profile-phases: timing dl/fwd/bwd/opt/mark over 25 micro-batches\n", flush=True)
+        model.train()
+        train_sampler.set_epoch(0)
+        # warm-up: 5 micro-batches so graph cache is hot before timing
+        warmup_n = 5
+        profile_n = 20
+        t_dl = t_fwd = t_bwd = t_opt = t_mark = 0.0
+        it = iter(train_loader)
+        for i in range(warmup_n + profile_n):
+            measure = i >= warmup_n
+            is_last_accum = ((i + 1) % grad_accum_steps) == 0
+            sync_ctx = contextlib.nullcontext() if is_last_accum else model.no_sync()
+
+            if measure:
+                torch.hpu.synchronize()
+            t0 = time.time()
+            input_ids, labels = next(it)
+            input_ids = input_ids.to(device)
+            labels = labels.to(device)
+            if measure:
+                torch.hpu.synchronize()
+                t_dl += time.time() - t0
+
+            with sync_ctx:
+                if measure:
+                    t0 = time.time()
+                with torch.autocast(device_type="hpu", dtype=torch.bfloat16, enabled=use_amp):
+                    logits = model(input_ids)
+                    loss = criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
+                    loss = loss / grad_accum_steps
+                if measure:
+                    torch.hpu.synchronize()
+                    t_fwd += time.time() - t0
+                    t0 = time.time()
+                loss.backward()
+                if measure:
+                    torch.hpu.synchronize()
+                    t_bwd += time.time() - t0
+
+            if measure:
+                t0 = time.time()
+            htcore.mark_step()
+            if measure:
+                torch.hpu.synchronize()
+                t_mark += time.time() - t0
+
+            if is_last_accum:
+                if measure:
+                    t0 = time.time()
+                _device_clip_grad_norm(model.parameters(), grad_clip)
+                optimizer.step()
+                htcore.mark_step()
+                optimizer.zero_grad(set_to_none=True)
+                if measure:
+                    torch.hpu.synchronize()
+                    t_opt += time.time() - t0
+
+        if is_main:
+            total = t_dl + t_fwd + t_bwd + t_opt + t_mark
+            print(
+                f"profile over {profile_n} micro-batches (after {warmup_n} warm-up):\n"
+                f"  dl={t_dl:.2f}s  fwd={t_fwd:.2f}s  bwd={t_bwd:.2f}s  "
+                f"opt={t_opt:.2f}s  mark={t_mark:.2f}s  total={total:.2f}s\n"
+                f"  avg per micro-batch: {total/profile_n*1000:.0f} ms",
+                flush=True,
+            )
+        cleanup_dist()
+        return
 
     stop = False
     for epoch in range(start_epoch, max_epochs):
