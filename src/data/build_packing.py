@@ -36,8 +36,6 @@ def build_packing(
     end_parts: list[np.ndarray] = []
     len_parts: list[np.ndarray] = []
     bin_paths: list[str] = []
-    dropped_zero_len = 0
-    dropped_too_long = 0
     t0 = time.time()
 
     for idx_path in idx_files:
@@ -54,18 +52,13 @@ def build_packing(
         starts = offsets[:-1]
         ends = offsets[1:]
         lens = ends - starts
-        dropped_zero_len += int((lens <= 0).sum())
-        dropped_too_long += int((lens > chunk_len).sum())
-        mask = (lens > 0) & (lens <= chunk_len)
+        mask = lens <= chunk_len
 
         n_kept = int(mask.sum())
         bin_parts.append(np.full(n_kept, bin_idx, dtype=np.int64))
         start_parts.append(starts[mask])
         end_parts.append(ends[mask])
         len_parts.append(lens[mask])
-
-    if not len_parts or sum(part.size for part in len_parts) == 0:
-        raise ValueError(f"No packable games found in {bin_dir}")
 
     bin_idxs = np.concatenate(bin_parts)
     starts = np.concatenate(start_parts)
@@ -78,11 +71,6 @@ def build_packing(
         f"  {N:,} games (<= {chunk_len} tokens) across {len(bin_paths):,} .bin files "
         f"in {time.time() - t0:.1f}s"
     )
-    if dropped_zero_len or dropped_too_long:
-        print(
-            f"  Dropped {dropped_zero_len:,} zero-length and "
-            f"{dropped_too_long:,} overlong games before packing"
-        )
 
     # Phase 2: first-fit packing, writing into preallocated numpy arrays
     rng = np.random.default_rng(seed)

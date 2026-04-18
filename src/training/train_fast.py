@@ -323,15 +323,12 @@ def train():
         loss_sum = torch.zeros((), device=device, dtype=torch.float32)
         token_sum = torch.zeros((), device=device, dtype=torch.float32)
         tokens_since_log = torch.zeros((), device=device, dtype=torch.float32)
-        empty_train_batches = torch.zeros((), device=device, dtype=torch.float32)
         t0 = time.time()
         batch_idx = -1
 
         for batch_idx, (input_ids, labels) in enumerate(train_loader):
             input_ids = input_ids.to(device)
             labels = labels.to(device)
-            n_tokens = (labels != PAD_ID).sum().to(torch.float32)
-            has_valid_targets = n_tokens.item() > 0
 
             is_last_accum = (batch_idx + 1) % grad_accum_steps == 0
             # Skip DDP all-reduce on the first (grad_accum-1) micro-batches.
@@ -342,15 +339,9 @@ def train():
             with sync_ctx:
                 with torch.autocast(device_type="hpu", dtype=torch.bfloat16, enabled=use_amp):
                     logits = model(input_ids)
-                    if has_valid_targets:
-                        loss = criterion(
-                            logits.reshape(-1, logits.size(-1)), labels.reshape(-1)
-                        )
-                    else:
-                        # Gaudi lazy loss replay can fail when all targets are
-                        # ignore_index. Still backprop a zero scalar that touches
-                        # every logit so DDP stays aligned across ranks.
-                        loss = logits.sum(dtype=torch.float32) * 0.0
+                    loss = criterion(
+                        logits.reshape(-1, logits.size(-1)), labels.reshape(-1)
+                    )
                     loss = loss / grad_accum_steps
                 loss.backward()
             # Flush the micro-batch graph. Without this, no_sync() removes DDP's
@@ -361,8 +352,7 @@ def train():
             htcore.mark_step()
 
             with torch.no_grad():
-                if not has_valid_targets:
-                    empty_train_batches += 1
+                n_tokens = (labels != PAD_ID).sum().to(torch.float32)
                 loss_sum += loss.detach() * grad_accum_steps * n_tokens
                 token_sum += n_tokens
                 tokens_since_log += n_tokens
@@ -429,34 +419,24 @@ def train():
 
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(token_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(empty_train_batches, op=dist.ReduceOp.SUM)
         train_avg = (loss_sum / token_sum).item() if token_sum.item() > 0 else 0.0
         if is_main:
             print(f"\nEpoch {epoch + 1}/{max_epochs} done | train loss: {train_avg:.4f}")
-            if empty_train_batches.item() > 0:
-                print(
-                    f"  warning: skipped loss on {int(empty_train_batches.item())} "
-                    "train micro-batches with only PAD targets"
-                )
 
         # --- Validation ---
         model.eval()
         val_loss_sum = torch.zeros((), device=device, dtype=torch.float32)
         val_token_sum = torch.zeros((), device=device, dtype=torch.float32)
-        empty_val_batches = torch.zeros((), device=device, dtype=torch.float32)
         with torch.no_grad():
             for i, (input_ids, labels) in enumerate(val_loader):
                 input_ids = input_ids.to(device)
                 labels = labels.to(device)
-                n_tokens = (labels != PAD_ID).sum().to(torch.float32)
-                if n_tokens.item() == 0:
-                    empty_val_batches += 1
-                    continue
                 with torch.autocast(device_type="hpu", dtype=torch.bfloat16, enabled=use_amp):
                     logits = model(input_ids)
                     loss = criterion(
                         logits.reshape(-1, logits.size(-1)), labels.reshape(-1)
                     )
+                n_tokens = (labels != PAD_ID).sum().to(torch.float32)
                 val_loss_sum += loss * n_tokens
                 val_token_sum += n_tokens
                 if (i + 1) % val_mark_every == 0:
@@ -465,16 +445,10 @@ def train():
 
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_token_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(empty_val_batches, op=dist.ReduceOp.SUM)
-        val_avg = (val_loss_sum / val_token_sum).item() if val_token_sum.item() > 0 else 0.0
+        val_avg = (val_loss_sum / val_token_sum).item()
 
         if is_main:
             print(f"  val loss: {val_avg:.4f}\n")
-            if empty_val_batches.item() > 0:
-                print(
-                    f"  warning: skipped {int(empty_val_batches.item())} "
-                    "validation micro-batches with only PAD targets"
-                )
 
         if is_main:
             path = os.path.join(ckpt_dir, f"epoch_{epoch + 1}.pt")
