@@ -29,6 +29,10 @@ export PYTHONUNBUFFERED=1
 export PT_HPU_LAZY_MODE=1
 export PT_HPU_ENABLE_LAZY_COLLECTIVES=0
 export PT_HPU_RECIPE_CACHE_CONFIG=/tmp/recipe_cache_${SLURM_JOB_ID},true,1024,false
+# Bypass the jit-fork recipe compiler path whose fork_pybind/_recipe_compiler_C.so
+# is missing habana::graph::GraphStorage::get() on this install. Non-fork path is
+# selected by passes.py:1268/2000 via ctx.use_jit_fork = bc.get_pt_hpu_use_jit_fork().
+export PT_HPU_USE_JIT_FORK=0
 
 NPROC_PER_NODE="${SLURM_GPUS_ON_NODE:-8}"
 if [[ -n "${HABANA_VISIBLE_MODULES:-}" ]]; then
