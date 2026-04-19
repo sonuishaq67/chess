@@ -223,24 +223,23 @@ def train():
     if is_main:
         print("DDP init broadcast complete.", flush=True)
 
-    # Graph compilation paths on Sol's pytorch-2.9.0-gaudi module are all blocked:
-    #   - wrap_in_hpu_graph: documented inference-only; crashes with "Empty tensor
-    #     optional" on backward + DDP no_sync (slurm.51595539).
-    #   - torch.compile(backend="hpu_backend"): broken install — undefined C++
-    #     symbol _ZN6habana5graph12GraphStorage3getEv in _recipe_compiler_C.so
-    #     (slurm.51596447, slurm.51596747).
-    # Fail loudly up-front if the user forgets --no-hpu-graphs, so we don't eat
-    # 28 min of data preload before hitting the ImportError.
+    # Graph compilation path:
+    #   - Diffusion env (habana-torch-plugin 1.22.0.740): torch.compile works.
+    #   - pytorch-2.9.0-gaudi (1.23.0.695): broken install — undefined C++ symbol
+    #     _ZN6habana5graph12GraphStorage3getEv in _recipe_compiler_C.so. Pass
+    #     --no-hpu-graphs on that env to fall back to pure lazy mode at ~54k tok/s.
+    #   - wrap_in_hpu_graph: documented inference-only; crashes on DDP + no_sync.
     if not args.no_hpu_graphs:
-        raise RuntimeError(
-            "Graph compilation disabled: both wrap_in_hpu_graph and "
-            "torch.compile(backend='hpu_backend') are blocked on this Sol module. "
-            "Pass --no-hpu-graphs to run in pure lazy mode."
-        )
-    htcore.mark_step()
-    torch.hpu.synchronize()
-    if is_main:
-        print("Lazy mode ready (--no-hpu-graphs).", flush=True)
+        model = torch.compile(model, backend="hpu_backend")
+        htcore.mark_step()
+        torch.hpu.synchronize()
+        if is_main:
+            print("torch.compile ready (hpu_backend).", flush=True)
+    else:
+        htcore.mark_step()
+        torch.hpu.synchronize()
+        if is_main:
+            print("Lazy mode ready (--no-hpu-graphs).", flush=True)
 
     # --- Dry run ---
     if args.dry_run:
