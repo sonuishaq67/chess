@@ -67,7 +67,7 @@ def _fused_attn_forward(
     k = apply_rope(k, rope_cos, rope_sin)
 
     dropout_p = self.attn_dropout.p if self.training else 0.0
-    out = FusedSDPA.apply(q, k, v, None, dropout_p, True, None, "None", False)
+    out = FusedSDPA.apply(q, k, v, None, dropout_p, True, None, "fast", False)
 
     out = out.transpose(1, 2).contiguous().view(batch, seq_len, -1)
     return self.w_o(out)
@@ -208,6 +208,7 @@ def train():
         sampler=train_sampler,
         num_workers=num_workers,
         drop_last=True,
+        pin_memory=True,
         prefetch_factor=4,
         persistent_workers=True,
     )
@@ -217,6 +218,7 @@ def train():
         sampler=val_sampler,
         num_workers=num_workers,
         drop_last=True,
+        pin_memory=True,
         prefetch_factor=4,
         persistent_workers=True,
     )
@@ -308,8 +310,8 @@ def train():
             print("\n--- One forward pass ---")
 
         inp, tgt = dataset[0]
-        inp = inp.unsqueeze(0).to(device)
-        tgt = tgt.unsqueeze(0).to(device)
+        inp = inp.unsqueeze(0).to(device, non_blocking=True)
+        tgt = tgt.unsqueeze(0).to(device, non_blocking=True)
         with torch.no_grad():
             with torch.autocast(device_type="hpu", dtype=torch.bfloat16, enabled=use_amp):
                 logits = model(inp)
@@ -389,8 +391,8 @@ def train():
                 torch.hpu.synchronize()
             t0 = time.time()
             input_ids, labels = next(it)
-            input_ids = input_ids.to(device)
-            labels = labels.to(device)
+            input_ids = input_ids.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             if measure:
                 torch.hpu.synchronize()
                 t_dl += time.time() - t0
@@ -455,8 +457,8 @@ def train():
         first_step_t0 = time.time() if epoch == start_epoch else None
 
         for batch_idx, (input_ids, labels) in enumerate(train_loader):
-            input_ids = input_ids.to(device)
-            labels = labels.to(device)
+            input_ids = input_ids.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
             is_last_accum = (batch_idx + 1) % grad_accum_steps == 0
             if use_graph_grad_accum:
@@ -569,8 +571,8 @@ def train():
         val_token_sum = torch.zeros((), device=device, dtype=torch.float32)
         with torch.no_grad():
             for i, (input_ids, labels) in enumerate(val_loader):
-                input_ids = input_ids.to(device)
-                labels = labels.to(device)
+                input_ids = input_ids.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
                 with torch.autocast(device_type="hpu", dtype=torch.bfloat16, enabled=use_amp):
                     logits = model(input_ids)
                     loss = criterion(
