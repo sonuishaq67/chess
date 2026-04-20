@@ -37,17 +37,19 @@ if [[ -n "${HABANA_VISIBLE_MODULES:-}" ]]; then
 fi
 
 BINDS=(
-    --bind /dev/accel:/dev/accel
     --bind "$REPO":/workspace/chess
     --bind "$DATA":/workspace/chess/dataset/packing:ro
 )
-# Binding /dev wholesale breaks /dev/null + /dev/urandom under SLURM cgroup.
-# Only bind host sysfs/config paths that exist on this node.
-for p in /sys/class/accel /sys/class/habanalabs /etc/habanalabs; do
-    if [[ -e "$p" ]]; then
-        BINDS+=(--bind "$p:$p:ro")
-    fi
-done
+# Apptainer's directory bind of /dev/accel doesn't preserve char-device
+# semantics for Synapse (hl-smi works, synDeviceAcquire fails with "No devices
+# found"). File-level binds of each device node do work — so enumerate
+# /dev/accel/* on the host and bind each one individually.
+if [[ -d /dev/accel ]]; then
+    for d in /dev/accel/*; do
+        [[ -c "$d" ]] && BINDS+=(--bind "$d:$d")
+    done
+fi
+# Apptainer already mounts /sys from host — don't overmount /sys/class/accel.
 
 ENVS=(
     --env PYTHONUNBUFFERED=1
@@ -58,12 +60,16 @@ ENVS=(
 )
 
 echo "Launching torchrun inside Apptainer with nproc_per_node=$NPROC_PER_NODE"
+echo "Binding ${#BINDS[@]} items (including $(ls /dev/accel/ 2>/dev/null | wc -l) accel device nodes)"
 
-# Call torchrun directly — no `bash -lc`. The login shell sources host
-# /etc/profile.d/modules.sh + ~/.bashrc, which redirect to /dev/null under the
-# SLURM cgroup view and fail with "Permission denied".
+# `bash -c` (no -l) — avoids the host modules.sh /dev/null cgroup issue from
+# bash -lc, while still letting us source Habana's profile.d so GC_KERNEL_PATH,
+# HABANA_PLUGINS_LIB_PATH, HABANA_SCAL_BIN_PATH, etc. are set for Synapse.
 apptainer exec --pwd /workspace/chess --writable-tmpfs "${BINDS[@]}" "${ENVS[@]}" "$SIF" \
-    torchrun --nproc_per_node=$NPROC_PER_NODE -m src.training.train_fast \
-        --config configs/training.yml \
-        --model-config configs/model.yml \
-        "$@"
+    bash -c '
+        for f in /etc/profile.d/habanalabs*.sh; do [ -f "$f" ] && source "$f"; done
+        exec torchrun --nproc_per_node='"$NPROC_PER_NODE"' -m src.training.train_fast \
+            --config configs/training.yml \
+            --model-config configs/model.yml \
+            '"$*"'
+    '
