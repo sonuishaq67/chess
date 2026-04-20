@@ -99,7 +99,7 @@ def _unwrap(model: nn.Module) -> nn.Module:
 
 
 def _set_graph_iteration_count(model: nn.Module, iteration: int) -> None:
-    """Tell ModuleCacher whether this forward starts a new grad-accum window."""
+    """Tell ModuleCacher about grad-accum phase when that mode is enabled."""
     inner = model
     while inner is not None:
         setter = getattr(inner, "set_iteration_count", None)
@@ -133,6 +133,17 @@ def train():
         help="training graph backend to use; default is Habana ModuleCacher",
     )
     parser.add_argument(
+        "--graph-max-graphs",
+        type=int,
+        default=1,
+        help="max cached training graphs; static-shape training should use 1",
+    )
+    parser.add_argument(
+        "--graph-grad-accum",
+        action="store_true",
+        help="let ModuleCacher keep separate graphs for grad-accum phases",
+    )
+    parser.add_argument(
         "--no-fused-sdpa",
         action="store_true",
         help="fallback: keep the manual attention forward from transformer.py",
@@ -151,6 +162,7 @@ def train():
     model_cfg = load_yaml(args.model_config)
     grad_accum_steps = cfg.get("grad_accum_steps", 1)
     graph_mode = "none" if args.no_hpu_graphs else args.graph_mode
+    use_graph_grad_accum = args.graph_grad_accum and grad_accum_steps > 1
 
     if is_main:
         print(f"Device: {device}  |  world_size: {world_size}")
@@ -232,16 +244,21 @@ def train():
         print("Model on HPU.", flush=True)
 
     if graph_mode == "modulecacher":
-        model = ht.hpu.ModuleCacher(max_graphs=4)(
+        model = ht.hpu.ModuleCacher(max_graphs=args.graph_max_graphs)(
             model=model,
             inplace=True,
-            have_grad_accumulation=grad_accum_steps > 1,
+            have_grad_accumulation=use_graph_grad_accum,
             log_frequency=200,
         )
         htcore.mark_step()
         torch.hpu.synchronize()
         if is_main:
-            print("ModuleCacher ready (training HPU graphs).", flush=True)
+            print(
+                "ModuleCacher ready "
+                f"(training HPU graphs, max_graphs={args.graph_max_graphs}, "
+                f"grad_accum_graphs={use_graph_grad_accum}).",
+                flush=True,
+            )
     elif graph_mode == "compile":
         if is_main:
             print("Graph mode compile selected; wrapping after DDP.", flush=True)
@@ -365,7 +382,8 @@ def train():
             measure = i >= warmup_n
             is_last_accum = ((i + 1) % grad_accum_steps) == 0
             sync_ctx = contextlib.nullcontext() if is_last_accum else model.no_sync()
-            _set_graph_iteration_count(model, 0 if (i % grad_accum_steps) == 0 else 1)
+            if use_graph_grad_accum:
+                _set_graph_iteration_count(model, 0 if (i % grad_accum_steps) == 0 else 1)
 
             if measure:
                 torch.hpu.synchronize()
@@ -441,9 +459,10 @@ def train():
             labels = labels.to(device)
 
             is_last_accum = (batch_idx + 1) % grad_accum_steps == 0
-            _set_graph_iteration_count(
-                model, 0 if (batch_idx % grad_accum_steps) == 0 else 1
-            )
+            if use_graph_grad_accum:
+                _set_graph_iteration_count(
+                    model, 0 if (batch_idx % grad_accum_steps) == 0 else 1
+                )
             # Skip DDP all-reduce on the first (grad_accum-1) micro-batches.
             # With eager HCCL (PT_HPU_ENABLE_LAZY_COLLECTIVES=0), this eliminates
             # 3 of every 4 blocking collective launches per optimizer step.

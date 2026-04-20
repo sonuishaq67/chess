@@ -41,4 +41,5 @@ torchrun --nproc_per_node="$NPROC_PER_NODE" -m src.training.train_fast \
     --config configs/training.yml \
     --model-config configs/model.yml \
     --graph-mode modulecacher \
+    --graph-max-graphs 1 \
     "$@"
