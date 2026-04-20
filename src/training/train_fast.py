@@ -3,6 +3,7 @@ import contextlib
 import math
 import os
 import time
+import warnings
 
 import torch
 import torch.distributed as dist
@@ -154,6 +155,25 @@ def train():
         help="time dl/fwd/bwd/opt/mark on first 20 micro-batches then exit",
     )
     args = parser.parse_args()
+
+    if not args.no_hpu_graphs and os.environ.get("PT_HPU_LAZY_MODE") != "1":
+        raise RuntimeError(
+            "HPU-graph training path requires PT_HPU_LAZY_MODE=1. "
+            "Either export PT_HPU_LAZY_MODE=1 or pass --no-hpu-graphs."
+        )
+
+    warnings.filterwarnings(
+        "error",
+        message="Calling mark_step function does not have any effect.*",
+    )
+    warnings.filterwarnings(
+        "error",
+        message="Calling add_step_closure function does not have any effect.*",
+    )
+    warnings.filterwarnings(
+        "error",
+        message="Calling iter_mark_step function does not have any effect.*",
+    )
 
     device, local_rank, rank, world_size = setup_dist()
     is_main = rank == 0
