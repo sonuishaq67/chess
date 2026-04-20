@@ -38,6 +38,13 @@ def get_lr(step: int, warmup_steps: int, max_steps: int, max_lr: float) -> float
     return min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * progress))
 
 
+def _prestart_persistent_workers(*loaders: DataLoader) -> None:
+    """Start DataLoader workers before any HPU state exists in the process."""
+    for loader in loaders:
+        if loader.num_workers > 0 and loader.persistent_workers:
+            iter(loader)
+
+
 def train():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/training.yml")
@@ -97,6 +104,10 @@ def train():
         prefetch_factor=4,
         persistent_workers=True,
     )
+
+    _prestart_persistent_workers(train_loader, val_loader)
+    if is_main:
+        print("Prestarted DataLoader workers before HPU init.", flush=True)
 
     # --- Model ---
     model = build_model(model_cfg, device)

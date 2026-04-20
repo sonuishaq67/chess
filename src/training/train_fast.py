@@ -110,6 +110,21 @@ def _set_graph_iteration_count(model: nn.Module, iteration: int) -> None:
         inner = getattr(inner, "module", None)
 
 
+def _prestart_persistent_workers(*loaders: DataLoader) -> None:
+    """Start DataLoader workers before any HPU state exists in the process.
+
+    PyTorch only forks worker processes on the first iter(loader). If that first
+    iterator is created after model/HPU initialization, the workers inherit the
+    HPU context and show up in hl-smi as device owners (`pt_data_worker`), which
+    is both misleading and can tank utilization. With persistent_workers=True,
+    a cheap iter(loader) here starts and caches the worker pool; the real epoch
+    iterator later calls DataLoader._reset(...) and begins from the start.
+    """
+    for loader in loaders:
+        if loader.num_workers > 0 and loader.persistent_workers:
+            iter(loader)
+
+
 def train():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/training.yml")
@@ -250,6 +265,10 @@ def train():
         prefetch_factor=4,
         persistent_workers=True,
     )
+
+    _prestart_persistent_workers(train_loader, val_loader)
+    if is_main:
+        print("Prestarted DataLoader workers before HPU init.", flush=True)
 
     # --- Model ---
     model = build_model(model_cfg, device)
