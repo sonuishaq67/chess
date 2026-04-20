@@ -37,7 +37,7 @@ if [[ -n "${HABANA_VISIBLE_MODULES:-}" ]]; then
 fi
 
 BINDS=(
-    --bind "$REPO":/workspace/chess
+    --bind "$REPO":/workspace/chess:rw
     --bind "$DATA":/workspace/chess/dataset/packing:ro
 )
 # Apptainer's directory bind of /dev/accel doesn't preserve char-device
@@ -46,7 +46,7 @@ BINDS=(
 # /dev/accel/* on the host and bind each one individually.
 if [[ -d /dev/accel ]]; then
     for d in /dev/accel/*; do
-        [[ -c "$d" ]] && BINDS+=(--bind "$d:$d")
+        [[ -c "$d" ]] && BINDS+=(--bind "$d:$d:rw")
     done
 fi
 # Apptainer already mounts /sys from host — don't overmount /sys/class/accel.
@@ -56,8 +56,11 @@ ENVS=(
     --env PT_HPU_LAZY_MODE=1
     --env PT_HPU_ENABLE_LAZY_COLLECTIVES=0
     --env "PT_HPU_RECIPE_CACHE_CONFIG=/tmp/recipe_cache_${SLURM_JOB_ID},true,1024,false"
-    --env "HABANA_VISIBLE_MODULES=${HABANA_VISIBLE_MODULES:-}"
+    --env HABANA_LOGS=/tmp
 )
+if [[ -n "${HABANA_VISIBLE_MODULES:-}" ]]; then
+    ENVS+=(--env "HABANA_VISIBLE_MODULES=${HABANA_VISIBLE_MODULES}")
+fi
 
 echo "Launching torchrun inside Apptainer with nproc_per_node=$NPROC_PER_NODE"
 echo "Binding ${#BINDS[@]} items (including $(ls /dev/accel/ 2>/dev/null | wc -l) accel device nodes)"
