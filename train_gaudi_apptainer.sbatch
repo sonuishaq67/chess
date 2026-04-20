@@ -59,9 +59,11 @@ ENVS=(
 
 echo "Launching torchrun inside Apptainer with nproc_per_node=$NPROC_PER_NODE"
 
-apptainer exec --writable-tmpfs "${BINDS[@]}" "${ENVS[@]}" "$SIF" \
-    bash -lc "cd /workspace/chess && \
-        torchrun --nproc_per_node=$NPROC_PER_NODE -m src.training.train_fast \
-            --config configs/training.yml \
-            --model-config configs/model.yml \
-            $*"
+# Call torchrun directly — no `bash -lc`. The login shell sources host
+# /etc/profile.d/modules.sh + ~/.bashrc, which redirect to /dev/null under the
+# SLURM cgroup view and fail with "Permission denied".
+apptainer exec --pwd /workspace/chess --writable-tmpfs "${BINDS[@]}" "${ENVS[@]}" "$SIF" \
+    torchrun --nproc_per_node=$NPROC_PER_NODE -m src.training.train_fast \
+        --config configs/training.yml \
+        --model-config configs/model.yml \
+        "$@"
