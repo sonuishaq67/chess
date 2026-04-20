@@ -37,11 +37,12 @@ if [[ -n "${HABANA_VISIBLE_MODULES:-}" ]]; then
 fi
 
 BINDS=(
-    --bind /dev:/dev
+    --bind /dev/accel:/dev/accel
     --bind "$REPO":/workspace/chess
     --bind "$DATA":/workspace/chess/dataset/packing:ro
 )
-# Only bind host sysfs/config paths if they exist on this node.
+# Binding /dev wholesale breaks /dev/null + /dev/urandom under SLURM cgroup.
+# Only bind host sysfs/config paths that exist on this node.
 for p in /sys/class/accel /sys/class/habanalabs /etc/habanalabs; do
     if [[ -e "$p" ]]; then
         BINDS+=(--bind "$p:$p:ro")
