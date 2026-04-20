@@ -245,9 +245,32 @@ def train():
     if is_main:
         print("Model on HPU.", flush=True)
 
+    if graph_mode == "compile":
+        if is_main:
+            print("Graph mode compile selected; wrapping after DDP.", flush=True)
+    elif graph_mode == "none":
+        if is_main:
+            print("Graph wrapping disabled; pure lazy mode.", flush=True)
+    else:
+        if is_main:
+            print("Graph mode modulecacher selected; wrapping after DDP.", flush=True)
+
+    # --- DDP wrap (outer) ---
+    # DDP MUST be outermost wrapper for model.no_sync() to be callable.
+    model = torch.nn.parallel.DistributedDataParallel(
+        model, broadcast_buffers=False
+    )
+
+    htcore.mark_step()
+    torch.hpu.synchronize()
+    if is_main:
+        print("DDP init broadcast complete.", flush=True)
+
     if graph_mode == "modulecacher":
-        model = ht.hpu.ModuleCacher(max_graphs=args.graph_max_graphs)(
-            model=model,
+        # Keep DDP outermost so model.no_sync() remains available, but wrap the
+        # inner module so the cached training graph sees the post-DDP module path.
+        ht.hpu.ModuleCacher(max_graphs=args.graph_max_graphs)(
+            model=model.module,
             inplace=True,
             have_grad_accumulation=use_graph_grad_accum,
             log_frequency=200,
@@ -261,23 +284,6 @@ def train():
                 f"grad_accum_graphs={use_graph_grad_accum}).",
                 flush=True,
             )
-    elif graph_mode == "compile":
-        if is_main:
-            print("Graph mode compile selected; wrapping after DDP.", flush=True)
-    else:
-        if is_main:
-            print("Graph wrapping disabled; pure lazy mode.", flush=True)
-
-    # --- DDP wrap (outer) ---
-    # DDP MUST be outermost wrapper for model.no_sync() to be callable.
-    model = torch.nn.parallel.DistributedDataParallel(
-        model, broadcast_buffers=False
-    )
-
-    htcore.mark_step()
-    torch.hpu.synchronize()
-    if is_main:
-        print("DDP init broadcast complete.", flush=True)
 
     # Graph compilation path is kept as an opt-in fallback only. Training HPU
     # graphs should use ModuleCacher in lazy mode; torch.compile is more
