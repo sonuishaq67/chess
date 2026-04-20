@@ -104,16 +104,21 @@ def train():
         print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # --- Resume: load into bare model BEFORE DDP wrap ---
-    resume_ckpt = None
+    resume_optimizer_state = None
     start_epoch = 0
     global_step = 0
     if args.resume:
-        resume_ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        # Keep checkpoint tensors on CPU during load. Mapping the full checkpoint
+        # to HPU eagerly places optimizer state on device and fragments memory
+        # before the first resumed step.
+        resume_ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
         model.load_state_dict(resume_ckpt["model"])
+        resume_optimizer_state = resume_ckpt.get("optimizer")
         start_epoch = resume_ckpt["epoch"]
         global_step = resume_ckpt["step"]
         if is_main:
             print(f"Resumed from {args.resume} (epoch {start_epoch}, step {global_step})")
+        del resume_ckpt
 
     # Flush .to(hpu) / state-dict load, then BLOCK until compile+exec finish.
     # htcore.mark_step is non-blocking; without the synchronize, a compile
@@ -183,8 +188,9 @@ def train():
         weight_decay=cfg.get("weight_decay", 0.1),
         betas=(0.9, 0.95),
     )
-    if resume_ckpt is not None:
-        optimizer.load_state_dict(resume_ckpt["optimizer"])
+    if resume_optimizer_state is not None:
+        optimizer.load_state_dict(resume_optimizer_state)
+        del resume_optimizer_state
 
     grad_accum_steps = cfg.get("grad_accum_steps", 1)
     max_epochs = cfg.get("max_epochs", 10)

@@ -162,10 +162,18 @@ def train():
     model_cfg = load_yaml(args.model_config)
     grad_accum_steps = cfg.get("grad_accum_steps", 1)
     graph_mode = "none" if args.no_hpu_graphs else args.graph_mode
-    use_graph_grad_accum = args.graph_grad_accum and grad_accum_steps > 1
+    use_graph_grad_accum = (
+        args.graph_grad_accum and grad_accum_steps > 1 and not args.profile_phases
+    )
 
     if is_main:
         print(f"Device: {device}  |  world_size: {world_size}")
+        if args.profile_phases and args.graph_grad_accum and grad_accum_steps > 1:
+            print(
+                "Disabling separate grad-accum graph captures for --profile-phases "
+                "to keep graph memory bounded.",
+                flush=True,
+            )
 
     # Patch MultiHeadAttention.forward -> FusedSDPA for the training process
     # only. Leaves src/model/transformer.py untouched so ONNX export for the
@@ -229,16 +237,28 @@ def train():
         print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # --- Resume: load into bare model BEFORE DDP/graph wrap ---
-    resume_ckpt = None
+    resume_optimizer_state = None
     start_epoch = 0
     global_step = 0
     if args.resume:
-        resume_ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        # Keep checkpoint tensors on CPU during load. Mapping the full checkpoint
+        # to HPU eagerly places optimizer state on device and fragments memory
+        # before ModuleCacher can capture the training graphs.
+        resume_ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
         model.load_state_dict(resume_ckpt["model"])
+        resume_optimizer_state = resume_ckpt.get("optimizer")
         start_epoch = resume_ckpt["epoch"]
         global_step = resume_ckpt["step"]
+        if args.profile_phases:
+            # Phase profiling only needs resumed weights. Let the optimizer
+            # allocate fresh state during the warm-up steps instead of loading
+            # the checkpoint's moment tensors onto HPU up front.
+            resume_optimizer_state = None
         if is_main:
             print(f"Resumed from {args.resume} (epoch {start_epoch}, step {global_step})")
+            if args.profile_phases:
+                print("Skipping optimizer-state restore for --profile-phases.", flush=True)
+        del resume_ckpt
 
     htcore.mark_step()
     torch.hpu.synchronize()
@@ -346,8 +366,9 @@ def train():
         weight_decay=cfg.get("weight_decay", 0.1),
         betas=(0.9, 0.95),
     )
-    if resume_ckpt is not None:
-        optimizer.load_state_dict(resume_ckpt["optimizer"])
+    if resume_optimizer_state is not None:
+        optimizer.load_state_dict(resume_optimizer_state)
+        del resume_optimizer_state
 
     max_epochs = cfg.get("max_epochs", 10)
     max_steps = max_epochs * (len(train_loader) // grad_accum_steps)
