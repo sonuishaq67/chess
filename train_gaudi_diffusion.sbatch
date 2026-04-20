@@ -11,11 +11,10 @@
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=ishaik4@asu.edu
 
-# Targets the gaudi-pytorch-diffusion-1.22.0.740 env where
-# torch.compile(backend='hpu_backend') actually works for training (verified in
-# test_diffusion_env.sbatch / slurm.51612512). The pytorch-2.9.0-gaudi env has a
-# broken _recipe_compiler_C.so ABI. Use this sbatch to run the compile-enabled
-# path; use train_gaudi_fast.sbatch (+ --no-hpu-graphs) as the lazy-mode fallback.
+# Targets the gaudi-pytorch-diffusion-1.22.0.740 env but now uses Habana's
+# training HPU graph wrapper (ModuleCacher) in lazy mode instead of
+# torch.compile. The earlier compile validation for this env was done on a toy
+# model and was too weak to prove the full Transformer+DDP training path.
 source /home/ishaik4/miniconda3/etc/profile.d/conda.sh
 conda activate /packages/envs/gaudi-pytorch-diffusion-1.22.0.740
 
@@ -28,21 +27,19 @@ echo "SLURM_GPUS_ON_NODE=${SLURM_GPUS_ON_NODE:-<unset>}"
 export PYTHONUNBUFFERED=1
 export PT_HPU_LAZY_MODE=1
 export PT_HPU_ENABLE_LAZY_COLLECTIVES=0
-export PT_HPU_RECIPE_CACHE_CONFIG=/tmp/recipe_cache_${SLURM_JOB_ID},true,1024,false
-# Bypass the jit-fork recipe compiler path whose fork_pybind/_recipe_compiler_C.so
-# is missing habana::graph::GraphStorage::get() on this install. Non-fork path is
-# selected by passes.py:1268/2000 via ctx.use_jit_fork = bc.get_pt_hpu_use_jit_fork().
-export PT_HPU_USE_JIT_FORK=0
+export PT_HPU_RECIPE_CACHE_CONFIG=/scratch/$USER/gaudi_recipe_cache,true,4096,false
 
 NPROC_PER_NODE="${SLURM_GPUS_ON_NODE:-8}"
 if [[ -n "${HABANA_VISIBLE_MODULES:-}" ]]; then
     IFS=',' read -r -a visible_modules <<< "$HABANA_VISIBLE_MODULES"
     NPROC_PER_NODE="${#visible_modules[@]}"
 fi
-echo "Launching torchrun (diffusion env: FusedSDPA + FusedAdamW + torch.compile + no_sync) with nproc_per_node=$NPROC_PER_NODE"
+echo "Launching torchrun (diffusion env: FusedSDPA + FusedAdamW + ModuleCacher HPU graphs + no_sync) with nproc_per_node=$NPROC_PER_NODE"
 
 cd ~/chess
 torchrun --nproc_per_node="$NPROC_PER_NODE" -m src.training.train_fast \
     --config configs/training.yml \
     --model-config configs/model.yml \
+    --graph-mode modulecacher \
+    --graph-max-graphs 1 \
     "$@"

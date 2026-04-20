@@ -23,17 +23,19 @@ echo "SLURM_GPUS_ON_NODE=${SLURM_GPUS_ON_NODE:-<unset>}"
 export PYTHONUNBUFFERED=1
 export PT_HPU_LAZY_MODE=1
 export PT_HPU_ENABLE_LAZY_COLLECTIVES=0
-export PT_HPU_RECIPE_CACHE_CONFIG=/tmp/recipe_cache_${SLURM_JOB_ID},true,1024,false
+export PT_HPU_RECIPE_CACHE_CONFIG=/scratch/$USER/gaudi_recipe_cache,true,4096,false
 
 NPROC_PER_NODE="${SLURM_GPUS_ON_NODE:-8}"
 if [[ -n "${HABANA_VISIBLE_MODULES:-}" ]]; then
     IFS=',' read -r -a visible_modules <<< "$HABANA_VISIBLE_MODULES"
     NPROC_PER_NODE="${#visible_modules[@]}"
 fi
-echo "Launching torchrun (fast path: FusedSDPA + FusedAdamW + HPU graphs + no_sync) with nproc_per_node=$NPROC_PER_NODE"
+echo "Launching torchrun (fast path: FusedSDPA + FusedAdamW + ModuleCacher HPU graphs + no_sync) with nproc_per_node=$NPROC_PER_NODE"
 
 cd ~/chess
 torchrun --nproc_per_node="$NPROC_PER_NODE" -m src.training.train_fast \
     --config configs/training.yml \
     --model-config configs/model.yml \
+    --graph-mode modulecacher \
+    --graph-max-graphs 1 \
     "$@"

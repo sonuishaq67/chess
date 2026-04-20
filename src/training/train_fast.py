@@ -3,6 +3,7 @@ import contextlib
 import math
 import os
 import time
+import warnings
 
 import torch
 import torch.distributed as dist
@@ -11,10 +12,10 @@ from torch.utils.data import DataLoader, DistributedSampler, random_split
 
 import yaml
 
+import habana_frameworks.torch as ht
 import habana_frameworks.torch.core as htcore
 from habana_frameworks.torch.hpex.optimizers import FusedAdamW
 from habana_frameworks.torch.hpex.kernels import FusedSDPA
-import habana_frameworks.torch.hpu.graphs as htgraphs
 
 from src.model import Transformer, TransformerConfig
 from src.model.transformer import MultiHeadAttention, apply_rope
@@ -67,7 +68,7 @@ def _fused_attn_forward(
     k = apply_rope(k, rope_cos, rope_sin)
 
     dropout_p = self.attn_dropout.p if self.training else 0.0
-    out = FusedSDPA.apply(q, k, v, None, dropout_p, True, None, "None", False)
+    out = FusedSDPA.apply(q, k, v, None, dropout_p, True, None, "fast", False)
 
     out = out.transpose(1, 2).contiguous().view(batch, seq_len, -1)
     return self.w_o(out)
@@ -98,6 +99,32 @@ def _unwrap(model: nn.Module) -> nn.Module:
     return inner
 
 
+def _set_graph_iteration_count(model: nn.Module, iteration: int) -> None:
+    """Tell ModuleCacher about grad-accum phase when that mode is enabled."""
+    inner = model
+    while inner is not None:
+        setter = getattr(inner, "set_iteration_count", None)
+        if setter is not None:
+            setter(iteration)
+            return
+        inner = getattr(inner, "module", None)
+
+
+def _prestart_persistent_workers(*loaders: DataLoader) -> None:
+    """Start DataLoader workers before any HPU state exists in the process.
+
+    PyTorch only forks worker processes on the first iter(loader). If that first
+    iterator is created after model/HPU initialization, the workers inherit the
+    HPU context and show up in hl-smi as device owners (`pt_data_worker`), which
+    is both misleading and can tank utilization. With persistent_workers=True,
+    a cheap iter(loader) here starts and caches the worker pool; the real epoch
+    iterator later calls DataLoader._reset(...) and begins from the start.
+    """
+    for loader in loaders:
+        if loader.num_workers > 0 and loader.persistent_workers:
+            iter(loader)
+
+
 def train():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/training.yml")
@@ -113,7 +140,24 @@ def train():
     parser.add_argument(
         "--no-hpu-graphs",
         action="store_true",
-        help="disable wrap_in_hpu_graph (fallback if graph capture misbehaves)",
+        help="disable graph wrapping and run pure lazy mode",
+    )
+    parser.add_argument(
+        "--graph-mode",
+        choices=("modulecacher", "compile", "none"),
+        default="modulecacher",
+        help="training graph backend to use; default is Habana ModuleCacher",
+    )
+    parser.add_argument(
+        "--graph-max-graphs",
+        type=int,
+        default=1,
+        help="max cached training graphs; static-shape training should use 1",
+    )
+    parser.add_argument(
+        "--graph-grad-accum",
+        action="store_true",
+        help="let ModuleCacher keep separate graphs for grad-accum phases",
     )
     parser.add_argument(
         "--no-fused-sdpa",
@@ -127,14 +171,44 @@ def train():
     )
     args = parser.parse_args()
 
+    if not args.no_hpu_graphs and os.environ.get("PT_HPU_LAZY_MODE") != "1":
+        raise RuntimeError(
+            "HPU-graph training path requires PT_HPU_LAZY_MODE=1. "
+            "Either export PT_HPU_LAZY_MODE=1 or pass --no-hpu-graphs."
+        )
+
+    warnings.filterwarnings(
+        "error",
+        message="Calling mark_step function does not have any effect.*",
+    )
+    warnings.filterwarnings(
+        "error",
+        message="Calling add_step_closure function does not have any effect.*",
+    )
+    warnings.filterwarnings(
+        "error",
+        message="Calling iter_mark_step function does not have any effect.*",
+    )
+
     device, local_rank, rank, world_size = setup_dist()
     is_main = rank == 0
 
     cfg = load_yaml(args.config)
     model_cfg = load_yaml(args.model_config)
+    grad_accum_steps = cfg.get("grad_accum_steps", 1)
+    graph_mode = "none" if args.no_hpu_graphs else args.graph_mode
+    use_graph_grad_accum = (
+        args.graph_grad_accum and grad_accum_steps > 1 and not args.profile_phases
+    )
 
     if is_main:
         print(f"Device: {device}  |  world_size: {world_size}")
+        if args.profile_phases and args.graph_grad_accum and grad_accum_steps > 1:
+            print(
+                "Disabling separate grad-accum graph captures for --profile-phases "
+                "to keep graph memory bounded.",
+                flush=True,
+            )
 
     # Patch MultiHeadAttention.forward -> FusedSDPA for the training process
     # only. Leaves src/model/transformer.py untouched so ONNX export for the
@@ -177,6 +251,7 @@ def train():
         sampler=train_sampler,
         num_workers=num_workers,
         drop_last=True,
+        pin_memory=True,
         prefetch_factor=4,
         persistent_workers=True,
     )
@@ -186,9 +261,14 @@ def train():
         sampler=val_sampler,
         num_workers=num_workers,
         drop_last=True,
+        pin_memory=True,
         prefetch_factor=4,
         persistent_workers=True,
     )
+
+    _prestart_persistent_workers(train_loader, val_loader)
+    if is_main:
+        print("Prestarted DataLoader workers before HPU init.", flush=True)
 
     # --- Model ---
     model = build_model(model_cfg, device)
@@ -196,21 +276,43 @@ def train():
         print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # --- Resume: load into bare model BEFORE DDP/graph wrap ---
-    resume_ckpt = None
+    resume_optimizer_state = None
     start_epoch = 0
     global_step = 0
     if args.resume:
-        resume_ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        # Keep checkpoint tensors on CPU during load. Mapping the full checkpoint
+        # to HPU eagerly places optimizer state on device and fragments memory
+        # before ModuleCacher can capture the training graphs.
+        resume_ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
         model.load_state_dict(resume_ckpt["model"])
+        resume_optimizer_state = resume_ckpt.get("optimizer")
         start_epoch = resume_ckpt["epoch"]
         global_step = resume_ckpt["step"]
+        if args.profile_phases:
+            # Phase profiling only needs resumed weights. Let the optimizer
+            # allocate fresh state during the warm-up steps instead of loading
+            # the checkpoint's moment tensors onto HPU up front.
+            resume_optimizer_state = None
         if is_main:
             print(f"Resumed from {args.resume} (epoch {start_epoch}, step {global_step})")
+            if args.profile_phases:
+                print("Skipping optimizer-state restore for --profile-phases.", flush=True)
+        del resume_ckpt
 
     htcore.mark_step()
     torch.hpu.synchronize()
     if is_main:
-        print("Model on HPU, ready for DDP wrap.", flush=True)
+        print("Model on HPU.", flush=True)
+
+    if graph_mode == "compile":
+        if is_main:
+            print("Graph mode compile selected; wrapping after DDP.", flush=True)
+    elif graph_mode == "none":
+        if is_main:
+            print("Graph wrapping disabled; pure lazy mode.", flush=True)
+    else:
+        if is_main:
+            print("Graph mode modulecacher selected; wrapping after DDP.", flush=True)
 
     # --- DDP wrap (outer) ---
     # DDP MUST be outermost wrapper for model.no_sync() to be callable.
@@ -223,19 +325,35 @@ def train():
     if is_main:
         print("DDP init broadcast complete.", flush=True)
 
-    # Graph compilation path:
-    #   - Diffusion env (habana-torch-plugin 1.22.0.740): torch.compile works.
-    #   - pytorch-2.9.0-gaudi (1.23.0.695): broken install — undefined C++ symbol
-    #     _ZN6habana5graph12GraphStorage3getEv in _recipe_compiler_C.so. Pass
-    #     --no-hpu-graphs on that env to fall back to pure lazy mode at ~54k tok/s.
-    #   - wrap_in_hpu_graph: documented inference-only; crashes on DDP + no_sync.
-    if not args.no_hpu_graphs:
+    if graph_mode == "modulecacher":
+        # Keep DDP outermost so model.no_sync() remains available, but wrap the
+        # inner module so the cached training graph sees the post-DDP module path.
+        ht.hpu.ModuleCacher(max_graphs=args.graph_max_graphs)(
+            model=model.module,
+            inplace=True,
+            have_grad_accumulation=use_graph_grad_accum,
+            log_frequency=200,
+        )
+        htcore.mark_step()
+        torch.hpu.synchronize()
+        if is_main:
+            print(
+                "ModuleCacher ready "
+                f"(training HPU graphs, max_graphs={args.graph_max_graphs}, "
+                f"grad_accum_graphs={use_graph_grad_accum}).",
+                flush=True,
+            )
+
+    # Graph compilation path is kept as an opt-in fallback only. Training HPU
+    # graphs should use ModuleCacher in lazy mode; torch.compile is more
+    # environment-sensitive and has hit recipe-compiler ABI issues on Sol.
+    if graph_mode == "compile":
         model = torch.compile(model, backend="hpu_backend")
         htcore.mark_step()
         torch.hpu.synchronize()
         if is_main:
             print("torch.compile ready (hpu_backend).", flush=True)
-    else:
+    elif graph_mode == "none":
         htcore.mark_step()
         torch.hpu.synchronize()
         if is_main:
@@ -257,8 +375,8 @@ def train():
             print("\n--- One forward pass ---")
 
         inp, tgt = dataset[0]
-        inp = inp.unsqueeze(0).to(device)
-        tgt = tgt.unsqueeze(0).to(device)
+        inp = inp.unsqueeze(0).to(device, non_blocking=True)
+        tgt = tgt.unsqueeze(0).to(device, non_blocking=True)
         with torch.no_grad():
             with torch.autocast(device_type="hpu", dtype=torch.bfloat16, enabled=use_amp):
                 logits = model(inp)
@@ -287,10 +405,10 @@ def train():
         weight_decay=cfg.get("weight_decay", 0.1),
         betas=(0.9, 0.95),
     )
-    if resume_ckpt is not None:
-        optimizer.load_state_dict(resume_ckpt["optimizer"])
+    if resume_optimizer_state is not None:
+        optimizer.load_state_dict(resume_optimizer_state)
+        del resume_optimizer_state
 
-    grad_accum_steps = cfg.get("grad_accum_steps", 1)
     max_epochs = cfg.get("max_epochs", 10)
     max_steps = max_epochs * (len(train_loader) // grad_accum_steps)
     if args.max_steps_override is not None:
@@ -332,13 +450,15 @@ def train():
             measure = i >= warmup_n
             is_last_accum = ((i + 1) % grad_accum_steps) == 0
             sync_ctx = contextlib.nullcontext() if is_last_accum else model.no_sync()
+            if use_graph_grad_accum:
+                _set_graph_iteration_count(model, 0 if (i % grad_accum_steps) == 0 else 1)
 
             if measure:
                 torch.hpu.synchronize()
             t0 = time.time()
             input_ids, labels = next(it)
-            input_ids = input_ids.to(device)
-            labels = labels.to(device)
+            input_ids = input_ids.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             if measure:
                 torch.hpu.synchronize()
                 t_dl += time.time() - t0
@@ -403,10 +523,14 @@ def train():
         first_step_t0 = time.time() if epoch == start_epoch else None
 
         for batch_idx, (input_ids, labels) in enumerate(train_loader):
-            input_ids = input_ids.to(device)
-            labels = labels.to(device)
+            input_ids = input_ids.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
             is_last_accum = (batch_idx + 1) % grad_accum_steps == 0
+            if use_graph_grad_accum:
+                _set_graph_iteration_count(
+                    model, 0 if (batch_idx % grad_accum_steps) == 0 else 1
+                )
             # Skip DDP all-reduce on the first (grad_accum-1) micro-batches.
             # With eager HCCL (PT_HPU_ENABLE_LAZY_COLLECTIVES=0), this eliminates
             # 3 of every 4 blocking collective launches per optimizer step.
@@ -513,8 +637,8 @@ def train():
         val_token_sum = torch.zeros((), device=device, dtype=torch.float32)
         with torch.no_grad():
             for i, (input_ids, labels) in enumerate(val_loader):
-                input_ids = input_ids.to(device)
-                labels = labels.to(device)
+                input_ids = input_ids.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
                 with torch.autocast(device_type="hpu", dtype=torch.bfloat16, enabled=use_amp):
                     logits = model(input_ids)
                     loss = criterion(

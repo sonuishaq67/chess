@@ -37,30 +37,42 @@ if [[ -n "${HABANA_VISIBLE_MODULES:-}" ]]; then
 fi
 
 BINDS=(
-    --bind /dev:/dev
-    --bind "$REPO":/workspace/chess
+    --bind "$REPO":/workspace/chess:rw
     --bind "$DATA":/workspace/chess/dataset/packing:ro
 )
-# Only bind host sysfs/config paths if they exist on this node.
-for p in /sys/class/accel /sys/class/habanalabs /etc/habanalabs; do
-    if [[ -e "$p" ]]; then
-        BINDS+=(--bind "$p:$p:ro")
-    fi
-done
+# Apptainer's directory bind of /dev/accel doesn't preserve char-device
+# semantics for Synapse (hl-smi works, synDeviceAcquire fails with "No devices
+# found"). File-level binds of each device node do work — so enumerate
+# /dev/accel/* on the host and bind each one individually.
+if [[ -d /dev/accel ]]; then
+    for d in /dev/accel/*; do
+        [[ -c "$d" ]] && BINDS+=(--bind "$d:$d:rw")
+    done
+fi
+# Apptainer already mounts /sys from host — don't overmount /sys/class/accel.
 
 ENVS=(
     --env PYTHONUNBUFFERED=1
     --env PT_HPU_LAZY_MODE=1
     --env PT_HPU_ENABLE_LAZY_COLLECTIVES=0
     --env "PT_HPU_RECIPE_CACHE_CONFIG=/tmp/recipe_cache_${SLURM_JOB_ID},true,1024,false"
-    --env "HABANA_VISIBLE_MODULES=${HABANA_VISIBLE_MODULES:-}"
+    --env HABANA_LOGS=/tmp
 )
+if [[ -n "${HABANA_VISIBLE_MODULES:-}" ]]; then
+    ENVS+=(--env "HABANA_VISIBLE_MODULES=${HABANA_VISIBLE_MODULES}")
+fi
 
 echo "Launching torchrun inside Apptainer with nproc_per_node=$NPROC_PER_NODE"
+echo "Binding ${#BINDS[@]} items (including $(ls /dev/accel/ 2>/dev/null | wc -l) accel device nodes)"
 
-apptainer exec --writable-tmpfs "${BINDS[@]}" "${ENVS[@]}" "$SIF" \
-    bash -lc "cd /workspace/chess && \
-        torchrun --nproc_per_node=$NPROC_PER_NODE -m src.training.train_fast \
+# `bash -c` (no -l) — avoids the host modules.sh /dev/null cgroup issue from
+# bash -lc, while still letting us source Habana's profile.d so GC_KERNEL_PATH,
+# HABANA_PLUGINS_LIB_PATH, HABANA_SCAL_BIN_PATH, etc. are set for Synapse.
+apptainer exec --pwd /workspace/chess --writable-tmpfs "${BINDS[@]}" "${ENVS[@]}" "$SIF" \
+    bash -c '
+        for f in /etc/profile.d/habanalabs*.sh; do [ -f "$f" ] && source "$f"; done
+        exec torchrun --nproc_per_node='"$NPROC_PER_NODE"' -m src.training.train_fast \
             --config configs/training.yml \
             --model-config configs/model.yml \
-            $*"
+            '"$*"'
+    '
