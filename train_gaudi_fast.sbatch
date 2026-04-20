@@ -30,10 +30,11 @@ if [[ -n "${HABANA_VISIBLE_MODULES:-}" ]]; then
     IFS=',' read -r -a visible_modules <<< "$HABANA_VISIBLE_MODULES"
     NPROC_PER_NODE="${#visible_modules[@]}"
 fi
-echo "Launching torchrun (fast path: FusedSDPA + FusedAdamW + HPU graphs + no_sync) with nproc_per_node=$NPROC_PER_NODE"
+echo "Launching torchrun (fast path: FusedSDPA + FusedAdamW + ModuleCacher HPU graphs + no_sync) with nproc_per_node=$NPROC_PER_NODE"
 
 cd ~/chess
 torchrun --nproc_per_node="$NPROC_PER_NODE" -m src.training.train_fast \
     --config configs/training.yml \
     --model-config configs/model.yml \
+    --graph-mode modulecacher \
     "$@"
