@@ -53,14 +53,16 @@ def train():
     parser.add_argument("--dry-run", action="store_true", help="one forward pass then exit")
     args = parser.parse_args()
 
-    device, local_rank, rank, world_size = setup_dist()
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     is_main = rank == 0
 
     cfg = load_yaml(args.config)
     model_cfg = load_yaml(args.model_config)
 
     if is_main:
-        print(f"Device: {device}  |  world_size: {world_size}")
+        print(f"Preparing training  |  world_size: {world_size}")
 
     # --- Data ---
     base_dir = os.path.dirname(os.path.abspath(__file__)).rsplit("/src", 1)[0]
@@ -108,6 +110,16 @@ def train():
     _prestart_persistent_workers(train_loader, val_loader)
     if is_main:
         print("Prestarted DataLoader workers before HPU init.", flush=True)
+
+    device, setup_local_rank, setup_rank, setup_world_size = setup_dist()
+    if (setup_rank, setup_world_size, setup_local_rank) != (rank, world_size, local_rank):
+        raise RuntimeError(
+            "torchrun env ranks do not match HCCL setup: "
+            f"env=(rank={rank}, world_size={world_size}, local_rank={local_rank}) "
+            f"hccl=(rank={setup_rank}, world_size={setup_world_size}, local_rank={setup_local_rank})"
+        )
+    if is_main:
+        print(f"Device: {device}  |  world_size: {world_size}")
 
     # --- Model ---
     model = build_model(model_cfg, device)

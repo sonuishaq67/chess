@@ -190,7 +190,11 @@ def train():
         message="Calling iter_mark_step function does not have any effect.*",
     )
 
-    device, local_rank, rank, world_size = setup_dist()
+    # Read torchrun-provided ranks early so DataLoader workers can be started
+    # before any HPU state exists in this process.
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     is_main = rank == 0
 
     cfg = load_yaml(args.config)
@@ -202,7 +206,7 @@ def train():
     )
 
     if is_main:
-        print(f"Device: {device}  |  world_size: {world_size}")
+        print(f"Preparing training  |  world_size: {world_size}")
         if args.profile_phases and args.graph_grad_accum and grad_accum_steps > 1:
             print(
                 "Disabling separate grad-accum graph captures for --profile-phases "
@@ -269,6 +273,16 @@ def train():
     _prestart_persistent_workers(train_loader, val_loader)
     if is_main:
         print("Prestarted DataLoader workers before HPU init.", flush=True)
+
+    device, setup_local_rank, setup_rank, setup_world_size = setup_dist()
+    if (setup_rank, setup_world_size, setup_local_rank) != (rank, world_size, local_rank):
+        raise RuntimeError(
+            "torchrun env ranks do not match HCCL setup: "
+            f"env=(rank={rank}, world_size={world_size}, local_rank={local_rank}) "
+            f"hccl=(rank={setup_rank}, world_size={setup_world_size}, local_rank={setup_local_rank})"
+        )
+    if is_main:
+        print(f"Device: {device}  |  world_size: {world_size}")
 
     # --- Model ---
     model = build_model(model_cfg, device)
