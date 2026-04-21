@@ -1,6 +1,7 @@
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -39,13 +40,20 @@ class ChessDataset(Dataset):
 
         # Preload every bin file into RAM. One copy per rank; workers inherit
         # via fork COW so there is no per-worker duplication of the data buffer.
+        # Scratch FS metadata latency (~60ms per open) dominates here, so fan
+        # out reads across a thread pool — np.fromfile drops the GIL during I/O.
         is_rank0 = os.environ.get("RANK", "0") == "0"
+        n_threads = int(os.environ.get("CHESS_BIN_LOAD_THREADS", "32"))
         if is_rank0:
-            print(f"Preloading {len(self.bin_paths)} bin files into RAM...")
+            print(
+                f"Preloading {len(self.bin_paths)} bin files into RAM "
+                f"({n_threads} threads)..."
+            )
         t0 = time.time()
-        self._bins: list[np.ndarray] = [
-            np.fromfile(p, dtype=np.uint16) for p in self.bin_paths
-        ]
+        with ThreadPoolExecutor(max_workers=n_threads) as pool:
+            self._bins: list[np.ndarray] = list(
+                pool.map(lambda p: np.fromfile(p, dtype=np.uint16), self.bin_paths)
+            )
         if is_rank0:
             total_gb = sum(b.nbytes for b in self._bins) / 1e9
             print(
