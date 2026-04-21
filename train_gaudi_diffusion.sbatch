@@ -11,10 +11,10 @@
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=ishaik4@asu.edu
 
-# Targets the gaudi-pytorch-diffusion-1.22.0.740 env but now uses Habana's
-# training HPU graph wrapper (ModuleCacher) in lazy mode instead of
-# torch.compile. The earlier compile validation for this env was done on a toy
-# model and was too weak to prove the full Transformer+DDP training path.
+# Targets the gaudi-pytorch-diffusion-1.22.0.740 env. Training HPU graphs via
+# ModuleCacher wrapping the bare model pre-DDP, with lazy collectives enabled
+# so HCCL all-reduce is captured inside the recipe instead of stalling the
+# replay on eager collectives.
 source /home/ishaik4/miniconda3/etc/profile.d/conda.sh
 conda activate /packages/envs/gaudi-pytorch-diffusion-1.22.0.740
 
@@ -26,7 +26,10 @@ echo "SLURM_GPUS_ON_NODE=${SLURM_GPUS_ON_NODE:-<unset>}"
 
 export PYTHONUNBUFFERED=1
 export PT_HPU_LAZY_MODE=1
-export PT_HPU_ENABLE_LAZY_COLLECTIVES=0
+# Lazy collectives are required when training HPU graphs are in use so HCCL
+# all-reduce can be captured inside the cached recipe and overlap with compute;
+# with eager collectives (0) the last-accum step stalls outside the graph.
+export PT_HPU_ENABLE_LAZY_COLLECTIVES=1
 export PT_HPU_RECIPE_CACHE_CONFIG=/scratch/$USER/gaudi_recipe_cache,true,4096,false
 
 NPROC_PER_NODE="${SLURM_GPUS_ON_NODE:-8}"
@@ -34,7 +37,7 @@ if [[ -n "${HABANA_VISIBLE_MODULES:-}" ]]; then
     IFS=',' read -r -a visible_modules <<< "$HABANA_VISIBLE_MODULES"
     NPROC_PER_NODE="${#visible_modules[@]}"
 fi
-echo "Launching torchrun (diffusion env: FusedSDPA + FusedAdamW + ModuleCacher HPU graphs + no_sync) with nproc_per_node=$NPROC_PER_NODE"
+echo "Launching torchrun (diffusion env: FusedSDPA + FusedAdamW + ModuleCacher HPU graphs + lazy collectives + no_sync) with nproc_per_node=$NPROC_PER_NODE"
 
 cd ~/chess
 torchrun --nproc_per_node="$NPROC_PER_NODE" -m src.training.train_fast \

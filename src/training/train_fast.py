@@ -12,10 +12,11 @@ from torch.utils.data import DataLoader, DistributedSampler, random_split
 
 import yaml
 
-import habana_frameworks.torch as ht
-import habana_frameworks.torch.core as htcore
-from habana_frameworks.torch.hpex.optimizers import FusedAdamW
-from habana_frameworks.torch.hpex.kernels import FusedSDPA
+# habana_frameworks is imported lazily inside train() so that the HPU backend
+# and its driver FDs are not registered in this process until AFTER DataLoader
+# workers have been forked. Otherwise forked workers inherit the registration
+# and hl-smi lists every `pt_data_worker` as an AIP owner, pinning the driver's
+# per-process bookkeeping on processes that never actually touch the device.
 
 from src.model import Transformer, TransformerConfig
 from src.model.transformer import MultiHeadAttention, apply_rope
@@ -54,6 +55,9 @@ def _fused_attn_forward(
     # Monkey-patched forward — uses FusedSDPA with is_causal=True so the
     # [seq,seq] mask is never materialized. causal_mask arg is accepted for
     # signature compatibility with the original forward but unused.
+    # Lazy import: see note at top of file about worker-fork ordering.
+    from habana_frameworks.torch.hpex.kernels import FusedSDPA
+
     batch, seq_len, _ = x.shape
 
     q = self.w_q(x)
@@ -274,6 +278,13 @@ def train():
     if is_main:
         print("Prestarted DataLoader workers before HPU init.", flush=True)
 
+    # Only register the habana backend after workers are forked. Child workers
+    # have now been created with no habana driver FDs or HCCL backend objects,
+    # so hl-smi will no longer list them as AIP owners.
+    import habana_frameworks.torch as ht
+    import habana_frameworks.torch.core as htcore
+    from habana_frameworks.torch.hpex.optimizers import FusedAdamW
+
     device, setup_local_rank, setup_rank, setup_world_size = setup_dist()
     if (setup_rank, setup_world_size, setup_local_rank) != (rank, world_size, local_rank):
         raise RuntimeError(
@@ -318,32 +329,16 @@ def train():
     if is_main:
         print("Model on HPU.", flush=True)
 
-    if graph_mode == "compile":
-        if is_main:
-            print("Graph mode compile selected; wrapping after DDP.", flush=True)
-    elif graph_mode == "none":
-        if is_main:
-            print("Graph wrapping disabled; pure lazy mode.", flush=True)
-    else:
-        if is_main:
-            print("Graph mode modulecacher selected; wrapping after DDP.", flush=True)
-
-    # --- DDP wrap (outer) ---
-    # DDP MUST be outermost wrapper for model.no_sync() to be callable.
-    model = torch.nn.parallel.DistributedDataParallel(
-        model, broadcast_buffers=False
-    )
-
-    htcore.mark_step()
-    torch.hpu.synchronize()
-    if is_main:
-        print("DDP init broadcast complete.", flush=True)
-
+    # Wrap ModuleCacher BEFORE DDP (restores the 539b0c4 order). DDP's Reducer
+    # builds its param->bucket mapping at DDP.__init__ time by walking the
+    # wrapped module's parameters; installing Cacher first means the captured
+    # training graph covers the entire forward/backward without a DDP-wrapper
+    # boundary splitting it. Lazy collectives (PT_HPU_ENABLE_LAZY_COLLECTIVES=1)
+    # then let HCCL all-reduce participate in the same recipe instead of
+    # stalling outside the replay.
     if graph_mode == "modulecacher":
-        # Keep DDP outermost so model.no_sync() remains available, but wrap the
-        # inner module so the cached training graph sees the post-DDP module path.
-        ht.hpu.ModuleCacher(max_graphs=args.graph_max_graphs)(
-            model=model.module,
+        model = ht.hpu.ModuleCacher(max_graphs=args.graph_max_graphs)(
+            model=model,
             inplace=True,
             have_grad_accumulation=use_graph_grad_accum,
             log_frequency=200,
@@ -357,6 +352,17 @@ def train():
                 f"grad_accum_graphs={use_graph_grad_accum}).",
                 flush=True,
             )
+
+    # --- DDP wrap (outer) ---
+    # DDP MUST be outermost wrapper for model.no_sync() to be callable.
+    model = torch.nn.parallel.DistributedDataParallel(
+        model, broadcast_buffers=False
+    )
+
+    htcore.mark_step()
+    torch.hpu.synchronize()
+    if is_main:
+        print("DDP init broadcast complete.", flush=True)
 
     # Graph compilation path is kept as an opt-in fallback only. Training HPU
     # graphs should use ModuleCacher in lazy mode; torch.compile is more
@@ -424,7 +430,7 @@ def train():
         del resume_optimizer_state
 
     max_epochs = cfg.get("max_epochs", 10)
-    max_steps = max_epochs * (len(train_loader) // grad_accum_steps)
+    max_steps = max_epochs * len(train_loader) // max(grad_accum_steps, 1)
     if args.max_steps_override is not None:
         max_steps = min(max_steps, args.max_steps_override)
     warmup_steps = cfg.get("warmup_steps", 500)
@@ -540,30 +546,12 @@ def train():
             input_ids = input_ids.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
-            is_last_accum = (batch_idx + 1) % grad_accum_steps == 0
-            if use_graph_grad_accum:
-                _set_graph_iteration_count(
-                    model, 0 if (batch_idx % grad_accum_steps) == 0 else 1
+            with torch.autocast(device_type="hpu", dtype=torch.bfloat16, enabled=use_amp):
+                logits = model(input_ids)
+                loss = criterion(
+                    logits.reshape(-1, logits.size(-1)), labels.reshape(-1)
                 )
-            # Skip DDP all-reduce on the first (grad_accum-1) micro-batches.
-            # With eager HCCL (PT_HPU_ENABLE_LAZY_COLLECTIVES=0), this eliminates
-            # 3 of every 4 blocking collective launches per optimizer step.
-            sync_ctx = contextlib.nullcontext() if is_last_accum else model.no_sync()
-
-            with sync_ctx:
-                with torch.autocast(device_type="hpu", dtype=torch.bfloat16, enabled=use_amp):
-                    logits = model(input_ids)
-                    loss = criterion(
-                        logits.reshape(-1, logits.size(-1)), labels.reshape(-1)
-                    )
-                    loss = loss / grad_accum_steps
-                loss.backward()
-            # Flush the micro-batch graph. Without this, no_sync() removes DDP's
-            # per-step all-reduce (which used to implicitly dispatch), so all 8
-            # accum micro-batches queue up in lazy mode — peak activation memory
-            # becomes 8× larger and OOMs (slurm.51590531: 192 MB attention-scores
-            # tensor, 18 layers × 8 micro-batches = 27 GB).
-            htcore.mark_step()
+            loss.backward()
 
             if first_step_t0 is not None and batch_idx == 0:
                 torch.hpu.synchronize()
@@ -573,71 +561,60 @@ def train():
                 first_step_t0 = None
                 t0 = time.time()
 
-            with torch.no_grad():
-                n_tokens = (labels != PAD_ID).sum().to(torch.float32)
-                loss_sum += loss.detach() * grad_accum_steps * n_tokens
-                token_sum += n_tokens
-                tokens_since_log += n_tokens
-
-            if is_last_accum:
-                lr = get_lr(global_step, warmup_steps, max_steps, max_lr)
-                for pg in optimizer.param_groups:
-                    pg["lr"] = lr
-
-                _device_clip_grad_norm(model.parameters(), grad_clip)
-                optimizer.step()
-                htcore.mark_step()
-                optimizer.zero_grad(set_to_none=True)
-                global_step += 1
-
-                if is_main and global_step % log_every == 0:
-                    loss_val = loss_sum.item()
-                    tokens_val = token_sum.item()
-                    avg = loss_val / tokens_val if tokens_val > 0 else 0.0
-                    elapsed = time.time() - t0
-                    tok_per_sec = (
-                        tokens_since_log.item() * world_size / elapsed if elapsed > 0 else 0.0
-                    )
-                    cur_loss = (loss.detach() * grad_accum_steps).item()
-                    print(
-                        f"  step {global_step:>6d} | loss {cur_loss:.4f} | "
-                        f"avg {avg:.4f} | lr {lr:.2e} | {tok_per_sec:.0f} tok/s (global)"
-                    )
-                    tokens_since_log.zero_()
-                    t0 = time.time()
-
-                if is_main and global_step % save_every == 0:
-                    path = os.path.join(ckpt_dir, f"step_{global_step}.pt")
-                    torch.save(
-                        {
-                            "model": _unwrap(model).state_dict(),
-                            "optimizer": optimizer.state_dict(),
-                            "epoch": epoch,
-                            "step": global_step,
-                            "config": model_cfg,
-                        },
-                        path,
-                    )
-                    print(f"  checkpoint saved: {path}")
-
-                if args.max_steps_override is not None and global_step >= args.max_steps_override:
-                    if is_main:
-                        print(f"Reached max_steps_override={args.max_steps_override}, stopping.")
-                    stop = True
-                    break
-
-        if stop:
-            break
-
-        if batch_idx >= 0 and (batch_idx + 1) % grad_accum_steps != 0:
             lr = get_lr(global_step, warmup_steps, max_steps, max_lr)
             for pg in optimizer.param_groups:
                 pg["lr"] = lr
+
             _device_clip_grad_norm(model.parameters(), grad_clip)
             optimizer.step()
             htcore.mark_step()
             optimizer.zero_grad(set_to_none=True)
             global_step += 1
+
+            with torch.no_grad():
+                n_tokens = (labels != PAD_ID).sum().to(torch.float32)
+                loss_sum += loss.detach() * n_tokens
+                token_sum += n_tokens
+                tokens_since_log += n_tokens
+
+            if is_main and global_step % log_every == 0:
+                loss_val = loss_sum.item()
+                tokens_val = token_sum.item()
+                avg = loss_val / tokens_val if tokens_val > 0 else 0.0
+                elapsed = time.time() - t0
+                tok_per_sec = (
+                    tokens_since_log.item() * world_size / elapsed if elapsed > 0 else 0.0
+                )
+                cur_loss = loss.detach().item()
+                print(
+                    f"  step {global_step:>6d} | loss {cur_loss:.4f} | "
+                    f"avg {avg:.4f} | lr {lr:.2e} | {tok_per_sec:.0f} tok/s (global)"
+                )
+                tokens_since_log.zero_()
+                t0 = time.time()
+
+            if is_main and global_step % save_every == 0:
+                path = os.path.join(ckpt_dir, f"step_{global_step}.pt")
+                torch.save(
+                    {
+                        "model": _unwrap(model).state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "epoch": epoch,
+                        "step": global_step,
+                        "config": model_cfg,
+                    },
+                    path,
+                )
+                print(f"  checkpoint saved: {path}")
+
+            if args.max_steps_override is not None and global_step >= args.max_steps_override:
+                if is_main:
+                    print(f"Reached max_steps_override={args.max_steps_override}, stopping.")
+                stop = True
+                break
+
+        if stop:
+            break
 
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(token_sum, op=dist.ReduceOp.SUM)
