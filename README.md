@@ -92,4 +92,24 @@ sbatch train_gaudi_apptainer.sbatch
 - **Gaudi training** targets 8× HPUs with DDP. The bare-metal path hits a `GraphStorage::get` ABI mismatch in the Sol host userspace; the containerized path (Apptainer + Habana's official 1.23.0 PyTorch image) is the working route.
 - **ONNX model** ships INT8-quantized and runs on 4 vCPUs with enough headroom for realtime Lichess play.
 
+## Gotchas I hit
+
+Battle scars from actually running this end-to-end. Writing them down so the next person (or the next me) doesn't re-lose a weekend to the same footguns.
+
+1. **`ThreadPoolExecutor` for PGN parsing does almost nothing.** `python-chess`'s `read_game` is pure Python → GIL-bound. `--workers 32` gave roughly one core of real parsing while the Slurm accounting looked busy. Switched the data pipeline to `ProcessPoolExecutor`.
+
+2. **DataLoader workers fork-duplicate Python containers.** With 16 workers and ~14M chunk entries stored as a Python list of tuples, each forked worker copied ~14 GB because CPython refcounts touch every object page and defeat copy-on-write. Flattened the index into two numpy arrays (`_packed`, `_bounds`) — now actually shared across workers.
+
+3. **`PYTHONUNBUFFERED=1` is not optional on SLURM.** Without it, Python block-buffers stdout into the SLURM log and the job looks frozen for hours while the GPU sits at 100%. Diagnosed by `nvidia-smi` showing activity with zero visible log progress.
+
+4. **Sol's cgroup accounting lies on threaded Python jobs.** A job that actually processed thousands of files came back with a completion email reporting `Max Memory Used: 0 B`, `% User: 0.00%`, `Max Disk Write: 0 B`. The cgroups sampler sometimes misses threaded Python entirely on certain nodes. Trust `slurm.out` and the scratch contents, not the email.
+
+5. **Gaudi sbatch scripts must use `#!/bin/bash -l` (login shell).** Non-login shells don't source `/etc/profile.d/habanalabs.sh`, so `GC_KERNEL_PATH` stays unset and every graph compile dies with the unhelpful `synStatus 26 [Generic failure]`. This is the #1 silent footgun for Gaudi on Sol.
+
+6. **Apptainer + Habana device binds are subtle.** Sol's Gaudi2 uses the newer `accel` kernel subsystem (`/dev/accel/accel0..7`, no `/dev/hl*`). Three traps: (a) `--bind /dev/accel:/dev/accel` (directory) lets `hl-smi` see 8 HPUs but breaks `synDeviceAcquire` with `synStatus=8 [Device not found]` — bind each `/dev/accel/*` file individually instead; (b) `--bind /dev:/dev` (whole /dev) breaks `/dev/null` and `/dev/urandom` under SLURM's cgroup view; (c) `bash -lc` inside `apptainer exec` retriggers the same `/dev/null: Permission denied` via `/etc/profile.d/modules.sh`. Use `bash -c` and explicitly source `/etc/profile.d/habanalabs*.sh` inside the container for `GC_KERNEL_PATH` and friends.
+
+7. **Bare-metal Gaudi graph compile is currently busted on Sol.** `torch.compile(backend="hpu_backend")` against `/packages/envs/pytorch-2.9.0-gaudi` fails with `_recipe_compiler_C.so: undefined symbol: _ZN6habana5graph12GraphStorage3getEv` — host userspace ABI mismatch. Lazy mode still works bare-metal as a fallback. The container path (host driver 1.23.0 matched to `pytorch-installer-2.9.0` image) is the real fix.
+
+8. **RoPE as complex exponentials does not survive ONNX export.** The PyTorch version precomputes `exp(i·mθ)` into a complex buffer, which is fine for CUDA training but the ONNX converter has no complex-tensor support. Export path uses a second RoPE implementation in real arithmetic, plus manual attention instead of SDPA.
+
 See `roadmap/README.md` for the original phase-by-phase task breakdown used while building this out.
