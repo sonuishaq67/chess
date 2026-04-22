@@ -441,7 +441,7 @@ def train():
     ckpt_dir = os.path.join(base_dir, cfg.get("checkpoint_dir", "checkpoints"))
     if is_main:
         os.makedirs(ckpt_dir, exist_ok=True)
-    dist.barrier()
+    dist.barrier(device_ids=[local_rank])
 
     log_every = cfg.get("log_every", 100)
     save_every = cfg.get("save_every", 2000)
