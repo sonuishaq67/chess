@@ -1,250 +1,95 @@
 # Chess Transformer
 
-A decoder-only transformer trained on Lichess game data for next-move prediction, treating chess as an autoregressive language modeling problem over UCI move sequences.
+A decoder-only transformer trained on Lichess games for next-move prediction. Chess as autoregressive language modeling over UCI move sequences — no board state, no search, just the move stream.
 
-## Architecture Overview
+The bot is live on Lichess.
+
+## At a glance
+
+| | |
+|---|---|
+| **Task**         | Next-move prediction on UCI sequences |
+| **Architecture** | Decoder-only transformer, RoPE, pre-norm, SiLU FFN, causal SDPA |
+| **Vocabulary**   | 1,972 tokens (1,968 legal UCI moves + PAD/BOS/EOS/MASK) |
+| **Context**      | 256 tokens |
+| **Trained model**| 205M params (d_model=1024, 16 layers, 16 heads), 1 epoch on 1× A100 |
+| **Scaling run**  | 512M config (d_model=1536, 18 layers, 24 heads) on 8× Intel Gaudi2 |
+| **Dataset**      | HuggingFace `Lichess/standard-chess-games`, filtered: both Elo > 2200, base time ≥ 180 s, ≥ 20 moves |
+| **Filtered set** | ~37.3M games, ~3.1B tokens, 9,635 shard pairs |
+| **Deployment**   | ONNX INT8 on AWS EC2 c6i.xlarge (eu-west-3), ~50 ms CPU inference |
+| **Bot status**   | Live on Lichess, systemd-managed, per-game logs |
+
+## Pipeline
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        DATA PIPELINE                            │
-│  HuggingFace Parquet ──► Filter ──► UCI Sequences               │
-│  (Lichess/standard-chess-games)  (Elo,TC)   (python-chess)      │
-└──────────────────────────────┬──────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                     TOKENIZATION & PREP                         │
-│  UCI Moves ──► Vocabulary (~1800 + special) ──► Integer Tensors │
-│  e2e4 g1f3...    PAD BOS EOS MASK               memory-mapped   │
-└──────────────────────────────┬──────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    TRAINING (ASU Sol)                            │
-│  Decoder-Only Transformer (GPT-style)                           │
-│  Distributed training (DDP/FSDP) · Mixed precision · SLURM      │
-└──────────────────────────────┬──────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   EXPORT & DEPLOYMENT                           │
-│  PyTorch ──► ONNX ──► ONNX Runtime ──► AWS EC2 (eu-west-3)     │
-│                        optimized          Lichess Bot API        │
-└─────────────────────────────────────────────────────────────────┘
+HuggingFace parquet  ──►  DuckDB filter  ──►  python-chess (PGN→UCI)
+                                                     │
+                                                     ▼
+                                      Tokenize → .bin/.idx memmap
+                                                     │
+                                                     ▼
+       ┌──────────────────────────────────────────────┴──────────────────────────────────┐
+       │                                                                                 │
+       ▼                                                                                 ▼
+  Train on Sol A100 (CUDA)                                              Train on Sol Gaudi2 (HPU, Apptainer)
+       │                                                                                 │
+       └────────────────────────────► Checkpoint ◄───────────────────────────────────────┘
+                                           │
+                                           ▼
+                              ONNX export + INT8 quantization
+                                           │
+                                           ▼
+                                AWS EC2 CPU ──► Lichess Bot API
 ```
 
-## Current Status
+## Repo layout
 
-| Phase | Status |
-|-------|--------|
-| 0. Environment & Setup | Done |
-| 1. Data Download & Exploration | Done |
-| 2. Data Filtering & Conversion | Done |
-| 3. Tokenization & Tensor Prep | ~90% — train/val/test split remaining |
-| 4. Transformer Architecture | ~80% — implemented, sanity checks remaining |
-| 5. Training on Sol | ~60% — train loop + SLURM script done, distributed training remaining |
-| 6. Evaluation & Analysis | Not started |
-| 7. ONNX Export & Optimization | ~80% — export, optimization, quantization, inference wrapper done; latency benchmark remaining |
-| 8. Deployment as Lichess Bot | Not started (stub files) |
+```
+chess/
+├── src/
+│   ├── data/         # extract_zst.py, uci_tokenizer.py, build_packing.py, query_parquet.py
+│   ├── model/        # transformer.py (RoPE, pre-norm, SDPA), embeddings.py
+│   ├── training/     # train.py (CUDA), train_fast.py (Gaudi/HPU), dataset.py, distributed.py
+│   └── serving/      # export.py (ONNX + INT8), inference.py, bot.py (Lichess API client)
+├── configs/          # model.yml, training.yml
+├── deploy/           # systemd unit files (chess-bot.service, crash-alert notifier)
+├── models/           # model.onnx, model_opt.onnx, model_int8.onnx
+├── chess-gaudi.def   # Apptainer def for Habana container (host driver 1.23.0)
+├── train.sbatch                   # single A100 on Sol
+├── train_gaudi.sbatch             # bare-metal Gaudi (lazy mode only, fallback)
+├── train_gaudi_fast.sbatch        # bare-metal Gaudi with graph compile (broken on current Sol host libs)
+├── train_gaudi_apptainer.sbatch   # containerized Gaudi (current primary path)
+├── cli.sh            # setup / check / data / tokenize / train / deploy wrappers
+└── roadmap/README.md # original task roadmap (kept for history)
+```
 
-## Data Decisions
+## Commands
 
-| Parameter         | Value                                                                 |
-|-------------------|-----------------------------------------------------------------------|
-| Source            | [HuggingFace](https://huggingface.co/datasets/Lichess/standard-chess-games) parquet |
-| Elo filter        | Both players > 2200                                                  |
-| Time control      | Base time >= 180s (rapid/classical)                                  |
-| Move format       | UCI (e.g. `e2e4`, `g1f3`)                                           |
-| Vocab size        | ~1800 unique move tokens + special tokens                            |
-| Min moves         | 20 per game (filters short resignations/aborts)                      |
-| Termination       | Checkmate, resignation, draws (agreement/stalemate/repetition). Exclude abandoned/timeout. |
+```bash
+./cli.sh setup                          # conda env + torch CUDA 12.4 + pip deps
+./cli.sh check                          # verify imports
+./cli.sh data                           # download HF parquet → filter → UCI
+./cli.sh tokenize                       # UCI text → uint16 .bin + .idx memmap
+./cli.sh train                          # single-GPU CUDA
+./cli.sh train '' '' --resume checkpoints/step_2000.pt
+./cli.sh train '' '' --dry-run
 
-## Infrastructure
+# Gaudi / Apptainer on Sol
+apptainer build /scratch/$USER/sif/chess-gaudi.sif chess-gaudi.def
+sbatch train_gaudi_apptainer.sbatch
 
-- **Training**: ASU Sol supercomputer (SLURM, multi-GPU)
-- **Export**: ONNX format
-- **Deployment**: AWS EC2 in eu-west-3 (France), Lichess Bot API
+# Deployment
+./cli.sh deploy-install                 # provision EC2
+./cli.sh deploy-setup
+./cli.sh bot-start | bot-stop | bot-status | bot-logs
+```
 
----
+## Notes on what's in here
 
-## Task Roadmap
+- **RoPE** is implemented two ways — as complex-exponential buffer for CUDA training, and rewritten in real arithmetic for the ONNX export (complex ops don't survive the converter).
+- **Data pipeline** uses DuckDB predicate pushdown to scan parquet without materializing full columns, then hands filtered PGN movetext to `python-chess` for SAN→UCI conversion. Processing runs in a `ProcessPoolExecutor` (threads were GIL-bound).
+- **DataLoader** stores chunk index as flat numpy arrays so forked workers share it via copy-on-write. Python lists of tuples fork-duplicated ~14 GB per worker.
+- **Gaudi training** targets 8× HPUs with DDP. The bare-metal path hits a `GraphStorage::get` ABI mismatch in the Sol host userspace; the containerized path (Apptainer + Habana's official 1.23.0 PyTorch image) is the working route.
+- **ONNX model** ships INT8-quantized and runs on 4 vCPUs with enough headroom for realtime Lichess play.
 
-### Phase 0: Environment & Setup
-
-- [x] Set up Python environment (venv or conda) with core dependencies
-  - [x] `python-chess` — PGN parsing and move conversion to UCI
-  - [x] `zstandard` — streaming decompression of .zst files
-  - [x] `torch` — model development and training
-  - [x] `tokenizers` (HuggingFace) — vocabulary building
-  - [x] `onnx` / `onnxruntime` — model export and inference
-- [x] Get Sol supercomputer access and test job submission
-- [x] Learn SLURM basics: `sbatch`, `srun`, `squeue`, `scancel`, resource requests
-- [x] Set up project directory structure:
-  ```
-  chess/
-  ├── dataset/
-  │   ├── parquet/       # downloaded HF parquet files
-  │   ├── uci/           # filtered games as UCI text (one game per line)
-  │   ├── bin/           # tokenized binary memmap (.bin + .idx)
-  │   └── vocab.json     # token↔id mapping (1972 tokens)
-  ├── src/
-  │   ├── data/          # extract_zst.py, query_parquet.py, uci_tokenizer.py
-  │   ├── model/         # transformer.py, embeddings.py
-  │   ├── training/      # train.py, dataset.py, distributed.py, slurm_job.sh
-  │   └── serving/       # export.py, inference.py, bot.py
-  ├── configs/           # model.yml, training.yml
-  ├── cli.sh             # project CLI (setup, data, tokenize, etc.)
-  └── README.md
-  ```
-- [x] Set up version control and `.gitignore` (exclude data, checkpoints, .zst files)
-
-### Phase 1: Data Download & Exploration
-
-- [x] Download parquet files from HuggingFace (Lichess/standard-chess-games)
-  - [x] Use `huggingface_hub` for downloads
-  - [x] Parquet format provides structured columns for efficient filtering
-- [x] Explore a single sample file to understand structure
-  - [x] Parse PGN headers: `WhiteElo`, `BlackElo`, `TimeControl`, `Termination`, `Result`
-  - [x] Understand move representation in PGN (SAN) vs UCI
-  - [x] Check metadata availability and consistency across months/years
-- [x] Estimate total game count across all files
-- [x] Estimate filtered game count (both players > 1900, base time >= 180s)
-- [x] Analyze termination reasons and their distribution
-- [x] Decide final filter thresholds based on exploration findings
-  - [x] Minimum move count for resignations
-  - [x] Any additional filters worth applying
-
-### Phase 2: Data Filtering & Conversion
-
-- [x] Build filtering pipeline from HuggingFace parquet files
-  - [x] Filter by Elo: both `WhiteElo` and `BlackElo` > 1900
-  - [x] Filter by time control: base time >= 180 seconds
-  - [x] Filter by termination: keep checkmate, resignation, draws (agreement/stalemate/repetition); exclude abandoned/timeout
-  - [x] Apply minimum move threshold for resignations
-- [x] Convert filtered PGN movetext (SAN) to UCI using `python-chess`
-  - [x] Handle edge cases: promotions (`e7e8q`), castling, en passant
-- [x] Output format: one game per line, UCI moves space-separated
-  - [x] Include metadata line or separate file (Elo, result, date) for later analysis
-- [x] Run pipeline across all downloaded files
-  - [x] Parallelize across parquet files
-- [x] Compute dataset statistics:
-  - [x] Total filtered games
-  - [x] Average / median game length (in moves)
-  - [x] Move frequency distribution
-  - [x] Elo distribution of filtered games
-  - [x] Result distribution (white win / black win / draw)
-
-### Phase 3: Tokenization & Tensor Preparation
-
-- [x] Build UCI move vocabulary
-  - [x] Enumerate all unique UCI moves seen in filtered data
-  - [x] Add special tokens: `PAD`, `BOS`, `EOS`, `MASK`
-  - [x] Save vocabulary mapping (token → id, id → token)
-  - [x] Verify vocab size (~1800 + specials)
-- [x] Tokenize all games: UCI move strings → integer sequences
-  - [x] Prepend `BOS`, append `EOS` to each game
-- [ ] Create train / validation / test split
-  - [ ] Split by date (preferred) or random
-  - [ ] Typical split: 95% / 2.5% / 2.5% or similar
-- [x] Pack tokenized sequences into efficient storage
-  - [x] Memory-mapped tensors (numpy `.npy` or PyTorch `.pt`) or Arrow/Parquet
-  - [x] Design DataLoader-friendly format (batching, padding, attention masks)
-- [x] Transfer prepared data to Sol's fast storage (scratch filesystem)
-- [x] Verify data loading speed with a dummy training loop
-
-### Phase 4: Transformer Architecture
-
-- [x] Determine model hyperparameters (based on dataset size):
-  - [x] Embedding dimension (128 tiny / 256 small / 768 full)
-  - [x] Number of attention heads (4 tiny / 8 small / 12 full)
-  - [x] Number of transformer layers (4 tiny / 8 small / 12 full)
-  - [x] Context length: 256 moves max
-  - [x] Dropout rate: 0.1
-  - [x] Vocabulary size: 1972 (1968 UCI moves + 4 special tokens)
-- [x] Choose positional encoding: **RoPE** (Rotary Position Embeddings)
-- [x] Implement decoder-only transformer
-  - [x] Token embedding + √d_model scaling
-  - [x] Causal multi-head self-attention (PyTorch `scaled_dot_product_attention`)
-  - [x] Feed-forward network with SiLU activation
-  - [x] Pre-norm layer normalization
-  - [x] Output projection to vocabulary logits
-- [ ] Sanity checks:
-  - [ ] Verify causal mask is correct (no future leakage)
-  - [ ] Overfit on a tiny batch (loss → ~0)
-  - [ ] Check parameter count matches expectations
-  - [ ] Verify output shape: `(batch, seq_len, vocab_size)`
-
-### Phase 5: Training on Sol
-
-- [x] Write SLURM job scripts
-  - [x] Resource requests: GPUs, memory, time limits
-  - [x] Module loads and environment activation
-  - [ ] Multi-node setup if needed
-- [ ] Set up distributed training
-  - [ ] DDP (DistributedDataParallel) for multi-GPU
-  - [ ] FSDP (FullyShardedDataParallel) if model doesn't fit in single GPU memory
-- [x] Configure mixed precision training (bf16 or fp16)
-- [x] Implement training loop
-  - [x] Cross-entropy loss on next-move prediction
-  - [x] Learning rate schedule: warmup + cosine decay
-  - [x] Gradient clipping
-  - [x] Optimizer: AdamW with weight decay
-- [x] Set up logging
-  - [x] Stdout logging: loss, avg loss, learning rate, throughput (tok/s)
-  - [ ] Weights & Biases or TensorBoard integration
-- [x] Implement checkpointing strategy
-  - [x] Save every N steps and at end of each epoch
-  - [ ] Keep best-K checkpoints by validation loss
-  - [x] Support resuming from checkpoint
-- [x] Evaluate during training
-  - [x] Validation loss every epoch
-  - [ ] Top-1 and top-5 move prediction accuracy on validation set
-
-### Phase 6: Evaluation & Analysis
-
-- [ ] Evaluate move prediction accuracy by game phase
-  - [ ] Opening (moves 1–10)
-  - [ ] Middlegame (moves 11–25)
-  - [ ] Endgame (moves 26+)
-- [ ] Compare model predictions against known opening theory
-  - [ ] Feed standard opening positions and check if model follows book lines
-- [ ] Analyze failure modes
-  - [ ] Positions where model confidence is low
-  - [ ] Illegal move rate (if generating outside legal move set)
-- [ ] Estimate approximate play strength (if feasible)
-- [ ] Generate sample full games via autoregressive generation
-  - [ ] Check for coherence and legal move sequences
-
-### Phase 7: ONNX Export & Optimization
-
-- [x] Export trained PyTorch model to ONNX format
-  - [x] Define input/output signatures
-  - [x] Handle dynamic sequence lengths
-  - [x] Verify ONNX model outputs match PyTorch outputs (numerical parity)
-- [x] Optimize with ONNX Runtime
-  - [x] Graph optimizations (constant folding, operator fusion)
-  - [x] Quantization if needed (INT8 dynamic or static)
-- [x] Inference wrapper with legal move filtering (python-chess)
-- [ ] Benchmark inference latency
-  - [ ] Measure on target hardware (CPU and/or GPU)
-  - [ ] Ensure latency is acceptable for Lichess bot (< 1–2 seconds per move)
-
-### Phase 8: Deployment as Lichess Bot
-
-- [x] Set up AWS EC2 instance in eu-west-3 (France)
-  - [x] Choose instance type (CPU or GPU based on latency requirements)
-  - [x] Install ONNX Runtime and dependencies
-- [x] Create Lichess bot account
-  - [x] Register account and request bot flag via Lichess API
-  - [x] Generate API token with bot scopes
-- [x] Implement Lichess Bot API integration
-  - [x] Connect to game stream (SSE / WebSocket)
-  - [x] Parse incoming game state to UCI move history
-  - [x] Feed move history to ONNX model, get next move prediction
-  - [x] Submit moves via Lichess API
-- [x] Implement move selection strategy
-  - [x] Argmax (strongest single prediction)
-  - [x] Temperature sampling (for variety)
-  - [x] Optionally filter to legal moves only before selection
-- [x] Test bot in casual games
-- [x] Monitor bot performance and resource usage in production
+See `roadmap/README.md` for the original phase-by-phase task breakdown used while building this out.
