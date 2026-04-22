@@ -439,9 +439,11 @@ def train():
     use_amp = cfg.get("use_amp", True)
 
     ckpt_dir = os.path.join(base_dir, cfg.get("checkpoint_dir", "checkpoints"))
-    if is_main:
-        os.makedirs(ckpt_dir, exist_ok=True)
-    dist.barrier(device_ids=[local_rank])
+    # HCCL on this stack handles the training collectives fine, but
+    # dist.barrier() falls back through a CPU device path and dies before
+    # training starts. Directory creation is idempotent, so let every rank
+    # ensure the path exists and avoid the backend-specific barrier entirely.
+    os.makedirs(ckpt_dir, exist_ok=True)
 
     log_every = cfg.get("log_every", 100)
     save_every = cfg.get("save_every", 2000)
